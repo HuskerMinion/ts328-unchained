@@ -40,12 +40,18 @@ else
 	ADMIN_HOOK=true
 fi
 
+# sync-in copies the overlay with the builder's owner and modes, also onto
+# existing directories such as / and /etc: give every overlay path back to
+# root, with no group or other write access.
+OVL_PATHS=$(cd overlay && find . | sed 's|^\./|/|; s|^\.$|/|' | LC_ALL=C sort | tr '\n' ' ')
+OVERLAY_FIX="for p in $OVL_PATHS; do chown -h 0:0 \"\$1\$p\" && if [ -d \"\$1\$p\" ]; then chmod 755 \"\$1\$p\"; else chmod go-w \"\$1\$p\"; fi || exit 1; done"
+
 mmdebstrap --mode=unshare --arch=arm64 --variant=important \
   --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
   --include=systemd-sysv,udev,systemd-resolved,openssh-server,sudo,mdadm,smartmontools,kmod,e2fsprogs,iproute2,iputils-ping,ca-certificates,nano,less,curl,unattended-upgrades,python3-gi,systemd-timesyncd,bash-completion,alsa-utils,locales,apparmor \
   --components=main --aptopt='APT::Install-Recommends "false"' \
   --customize-hook='sync-in overlay /' \
-  --customize-hook='chroot "$1" chown -R root:root /etc/fstab /etc/hostname /etc/hosts /etc/qnas-root /etc/systemd/network /etc/systemd/system/ssh.service.d /etc/ssh/sshd_config.d /etc/systemd/logind.conf.d /etc/systemd/system.conf.d /etc/systemd/resolved.conf.d' \
+  --customize-hook="$OVERLAY_FIX" \
   --customize-hook="upload \"$KEYS\" /root/.ssh/authorized_keys" \
   --customize-hook='chroot "$1" sh -c "chmod 700 /root /root/.ssh; chmod 600 /root/.ssh/authorized_keys; chown -R root:root /root"' \
   --customize-hook="$ADMIN_HOOK" \
@@ -58,6 +64,13 @@ mmdebstrap --mode=unshare --arch=arm64 --variant=important \
   "deb http://deb.debian.org/debian bookworm main" \
   "deb http://deb.debian.org/debian bookworm-updates main" \
   "deb http://security.debian.org/debian-security bookworm-security main"
+# nothing in the image may belong to the user who built it (home folders
+# aside: an ADMIN_USER can get the same uid)
+me=$(id -u)
+if [ "$me" != 0 ]; then
+	tar --numeric-owner -tvf out/rootfs.tar | awk -v u="$me" '{split($2, o, "/")} o[1] == u && $6 !~ /^\.\/home\// {print; n++} END {exit n > 0}' ||
+		{ echo "rootfs.tar has files owned by uid $me (listed above)" >&2; exit 1; }
+fi
 # ext4 without features that the vendor 4.2.8 kernel (QTS) cannot mount, so
 # QTS can still read it
 rm -f out/root.ext4
