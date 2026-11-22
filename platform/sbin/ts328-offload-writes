@@ -1,0 +1,122 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Move the frequent writes off the eMMC onto a data volume (default
+# /srv/data), so the eMMC mostly only gets read:
+# - the systemd journal: bind mount of <data>/system/journal on
+#   /var/log/journal. If the data volume is missing at boot, the journal
+#   stays in RAM (/run) instead, and the system still boots.
+# - Podman (root) container storage: <data>/system/containers, bind-mounted
+#   on /var/lib/containers
+# - Samba: log to the journal instead of /var/log/samba
+# - /tmp: tmpfs (RAM)
+# Then enables the daily eMMC write meter (ts328-emmc-writes.timer).
+#
+# Usage, as root: ts328-offload-writes [/srv/data]
+# Run it again at any time; it only changes what is not done yet.
+set -eu
+DATA=${1:-/srv/data}
+SYS=$DATA/system
+
+mountpoint -q "$DATA" || { echo "$DATA is not a mounted file system" >&2; exit 1; }
+case $(findmnt -no SOURCE "$DATA") in /dev/mmcblk0*) echo "$DATA is on the eMMC" >&2; exit 1;; esac
+[ -e /etc/fstab ] && grep -qE "[[:space:]]$DATA[[:space:]].*nofail" /etc/fstab ||
+	echo "note: add nofail to the $DATA line in /etc/fstab, so the box boots without it" >&2
+mkdir -p "$SYS/journal" "$SYS/containers"
+
+# 1. journal
+unit=/etc/systemd/system/var-log-journal.mount
+cat > $unit.new <<EOF
+# ts328-offload-writes: keep the journal on the data volume
+[Unit]
+Description=Journal on the data volume
+RequiresMountsFor=$DATA
+ConditionPathIsDirectory=$SYS/journal
+
+[Mount]
+What=$SYS/journal
+Where=/var/log/journal
+Type=none
+Options=bind
+EOF
+if ! cmp -s $unit.new $unit 2>/dev/null; then
+	mv $unit.new $unit
+	if ! mountpoint -q /var/log/journal; then
+		# journald writes to /run while its files are copied, then moves
+		# back onto the new location (and flushes /run into it)
+		journalctl --relinquish-var
+		cp -a /var/log/journal/. "$SYS/journal/"
+		systemctl daemon-reload
+		systemctl start var-log-journal.mount
+		journalctl --flush
+		# free the old copy underneath the mount
+		mkdir -p /run/ts328-under && mount --bind / /run/ts328-under
+		find /run/ts328-under/var/log/journal -mindepth 1 -delete
+		umount /run/ts328-under && rmdir /run/ts328-under
+	fi
+	echo "journal: on $SYS/journal"
+else
+	rm $unit.new
+fi
+# systemd-journal-flush.service pulls the mount in through its
+# RequiresMountsFor=/var/log/journal; nothing to enable.
+
+# 2. Podman: bind mount of <data>/system/containers on /var/lib/containers,
+# so Podman keeps its usual paths (its database records them)
+if command -v podman >/dev/null 2>&1; then
+	unit=/etc/systemd/system/var-lib-containers.mount
+	if [ ! -e $unit ]; then
+		# (before running podman, which creates an empty store)
+		if [ -n "$(ls -A "$SYS/containers")" ] && [ -n "$(ls -A /var/lib/containers 2>/dev/null)" ]; then
+			echo "both /var/lib/containers and $SYS/containers hold data; merge them by hand" >&2; exit 1
+		fi
+		[ -z "$(podman ps -q 2>/dev/null)" ] || { echo "stop the running containers first" >&2; exit 1; }
+		cat > $unit <<EOF
+# ts328-offload-writes: container storage on the data volume
+[Unit]
+Description=Container storage on the data volume
+RequiresMountsFor=$DATA
+ConditionPathIsDirectory=$SYS/containers
+Before=podman.service podman.socket podman-restart.service podman-auto-update.service
+
+[Mount]
+What=$SYS/containers
+Where=/var/lib/containers
+Type=none
+Options=bind
+
+[Install]
+WantedBy=multi-user.target
+EOF
+		mkdir -p /var/lib/containers
+		cp -a /var/lib/containers/. "$SYS/containers/"
+		systemctl daemon-reload
+		systemctl enable --now var-lib-containers.mount >/dev/null 2>&1
+		# free the old copy underneath the mount
+		mkdir -p /run/ts328-under && mount --bind / /run/ts328-under
+		find /run/ts328-under/var/lib/containers -mindepth 1 -delete
+		umount /run/ts328-under && rmdir /run/ts328-under
+		echo "podman: storage on $SYS/containers"
+	fi
+fi
+
+# 3. Samba
+if [ -f /etc/samba/smb.conf ] && grep -qE '^[[:space:]]*logging = file' /etc/samba/smb.conf; then
+	sed -i 's/^\([[:space:]]*\)logging = file/\1logging = systemd/' /etc/samba/smb.conf
+	systemctl try-restart smbd nmbd 2>/dev/null || true
+	echo "samba: logs to the journal"
+fi
+
+# 4. /tmp in RAM (takes effect at the next boot)
+if [ ! -e /etc/systemd/system/tmp.mount ] && [ -e /usr/share/systemd/tmp.mount ]; then
+	cp /usr/share/systemd/tmp.mount /etc/systemd/system/tmp.mount
+	systemctl daemon-reload
+	systemctl enable tmp.mount >/dev/null 2>&1
+	echo "/tmp: tmpfs from the next boot"
+fi
+
+# 5. write meter
+if [ -e /etc/systemd/system/ts328-emmc-writes.timer ]; then
+	systemctl enable --now ts328-emmc-writes.timer >/dev/null 2>&1
+fi
+echo done

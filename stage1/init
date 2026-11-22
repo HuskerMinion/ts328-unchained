@@ -49,8 +49,9 @@ probe() {	# probe <partition> <kind>
 			blockdev --setrw /dev/$1
 			# Mounted read-write here: the root needs no /etc/fstab entry,
 			# which would be ambiguous while a stick and the eMMC carry
-			# copies of the same image.
-			if mount -t ext4 -o rw,noatime,errors=remount-ro /dev/$1 /newroot; then
+			# copies of the same image. commit=60: fewer small writes to
+			# flash (up to 60 s of changes can be lost on a power cut).
+			if mount -t ext4 -o rw,noatime,commit=60,errors=remount-ro /dev/$1 /newroot; then
 				log "root on /dev/$1 ($2)"
 				return 0
 			fi

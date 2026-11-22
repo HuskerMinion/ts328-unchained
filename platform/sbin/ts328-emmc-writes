@@ -1,0 +1,40 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Daily eMMC write meter. The TS-328's eMMC does not report its own wear
+# (life_time and pre_eol_info read 0), so this records how much is
+# written to the root file system per day instead (ext4
+# lifetime_write_kbytes survives reboots).
+#
+# It logs one line to the journal, appends it to <data>/system/emmc-writes.csv
+# when the data volume is mounted, and logs a warning above LIMIT_MIB per day.
+#
+# Usage: ts328-emmc-writes [/srv/data]    (run daily by ts328-emmc-writes.timer)
+set -eu
+DATA=${1:-/srv/data}
+LIMIT_MIB=${LIMIT_MIB:-1024}
+STATE=/var/lib/ts328/emmc-writes.last
+
+dev=$(findmnt -no SOURCE /); dev=${dev#/dev/}
+case $dev in mmcblk0*) ;; *) echo "root is on $dev, not the eMMC: nothing to measure"; exit 0;; esac
+now_kib=$(cat /sys/fs/ext4/"$dev"/lifetime_write_kbytes)
+now_t=$(date +%s)
+
+mkdir -p "$(dirname $STATE)"
+if read -r last_t last_kib < $STATE 2>/dev/null; then
+	days_x100=$(( (now_t - last_t) * 100 / 86400 )); [ $days_x100 -gt 0 ] || days_x100=1
+	per_day=$(( (now_kib - last_kib) / 1024 * 100 / days_x100 ))
+	msg="eMMC root: $per_day MiB/day since $(date -d @"$last_t" +%F), $((now_kib / 1048576)) GiB in total"
+	if [ $per_day -gt "$LIMIT_MIB" ]; then
+		logger -t ts328-emmc-writes -p user.warning "$msg (more than $LIMIT_MIB MiB/day)"
+	else
+		logger -t ts328-emmc-writes "$msg"
+	fi
+	echo "$msg"
+	if mountpoint -q "$DATA"; then
+		f=$DATA/system/emmc-writes.csv
+		[ -e "$f" ] || echo "date,mib_per_day,total_gib" > "$f"
+		echo "$(date +%F),$per_day,$((now_kib / 1048576))" >> "$f"
+	fi
+fi
+echo "$now_t $now_kib" > $STATE

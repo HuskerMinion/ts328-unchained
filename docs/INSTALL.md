@@ -188,7 +188,7 @@ On the NAS:
 
 ```sh
 install -m 755 /root/platform/sbin/* /usr/local/sbin/
-install -m 644 /root/platform/systemd/*.service /etc/systemd/system/
+install -m 644 /root/platform/systemd/*.service /root/platform/systemd/*.timer /etc/systemd/system/
 install -D -m 755 /root/platform/system-shutdown/qnap-mcu-poweroff /usr/lib/systemd/system-shutdown/qnap-mcu-poweroff
 systemctl daemon-reload && systemctl enable --now qnap-fan.service qnap-panel.service
 sh /root/platform/voice/install.sh
@@ -199,10 +199,66 @@ The logind settings for the power button are already in the image.
 For the RAID voice prompts, add `PROGRAM /usr/local/sbin/md-event` to
 `/etc/mdadm/mdadm.conf` and run `systemctl restart mdmonitor`.
 
-## 6. Recovery and going back
+## 6. Data drives, and less wear on the eMMC
+
+The eMMC is small, old flash and does not report its own wear. Most of the
+time Debian only reads it, but the journal, Samba logs and containers keep
+writing. Keep those on the data drives, so the eMMC lasts as long as the box.
+
+### 6.1 Create the data volume
+
+Check the drive names with `lsblk`; this erases them. For three drives
+(RAID 5):
+
+```sh
+for d in sda sdb sdc; do
+  printf 'label: gpt\ntype=A19D880F-05FC-4D3B-A006-743F0F84911E, name=data-raid\n' | sfdisk /dev/$d
+done
+mdadm --create /dev/md0 --level=5 --raid-devices=3 /dev/sda1 /dev/sdb1 /dev/sdc1
+mkfs.ext4 -L data /dev/md0
+mdadm --detail --scan >> /etc/mdadm/mdadm.conf
+mkdir -p /srv/data
+echo "UUID=$(blkid -s UUID -o value /dev/md0) /srv/data ext4 noatime,nofail 0 2" >> /etc/fstab
+systemctl daemon-reload && mount /srv/data
+```
+
+Two drives: `--level=1 --raid-devices=2`. One drive: skip `mdadm` and make
+the file system on `/dev/sda1`. `nofail` matters: without it the box does
+not finish booting when the volume is missing. The first RAID sync takes
+many hours; the volume can be used meanwhile.
+
+### 6.2 Move the frequent writes off the eMMC
+
+```sh
+ts328-offload-writes /srv/data
+reboot
+```
+
+`ts328-offload-writes` (installed with the platform extras in step 5) does this:
+
+- the systemd journal lives in `/srv/data/system/journal`, bind-mounted on
+  `/var/log/journal`. If the data volume is missing at boot, the journal
+  stays in RAM and the box still boots.
+- Podman's container storage moves to `/srv/data/system/containers`.
+- Samba logs to the journal instead of `/var/log/samba`.
+- `/tmp` is in RAM.
+- a daily meter (`ts328-emmc-writes.timer`) logs how much was written to
+  the eMMC, and warns above 1 GiB a day: `journalctl -t ts328-emmc-writes`,
+  history in `/srv/data/system/emmc-writes.csv`.
+
+The root file system is also mounted with `commit=60` by stage 1, so small
+writes are batched (at most 60 s of changes are lost on a power cut).
+Keep big or busy things (downloads, virtual machines, rootless containers)
+on `/srv/data`, not in home folders, which are on the eMMC.
+
+## 7. Recovery and going back
 
 - **The eMMC system does not boot:** boot the rescue stick with USB Copy
   held (step 3) and repair the eMMC from there.
+- **The eMMC has failed completely:** U-Boot lives in the SPI flash, not on
+  the eMMC, so the rescue stick still boots the whole system. Hold USB Copy
+  at every power-on (after a power cut too). The stick holds its own basic
+  copy of Debian; the data volume is not touched.
 - **Back to the QTS kernel:** from the rescue stick system, lift
   `write_min_lba` (`echo 0 > ...`), mount partition 2, and rename the
   `*.qts` files back over `Image`, `realtek.dtb`, `initrd.boot` and their
@@ -213,7 +269,7 @@ For the RAID voice prompts, add `PROGRAM /usr/local/sbin/md-event` to
   dd if=emmc-user.img of=/dev/mmcblk0 bs=4M conv=fsync
   ```
 
-## 7. Optional: remove QTS from the eMMC
+## 8. Optional: remove QTS from the eMMC
 
 Once you no longer need QTS, its files can go (about 450 MB). Your backup
 images from step 1 are then the only way back. U-Boot only reads `Image`,
