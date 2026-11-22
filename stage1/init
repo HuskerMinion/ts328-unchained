@@ -1,0 +1,109 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Stage 1 for the QNAP TS-328: find the Debian root and switch_root to it.
+#
+# The root is an ext4 file system with /etc/qnas-root = QNAS-ROOT-v1 and
+# a /sbin/init.
+# - Normal boot: eMMC partition 7 first, then other internal partitions.
+#   A USB root is only considered after the internal storage has had time
+#   to appear, so a stick left in a port does not take over the boot.
+# - Recovery boot (USB Copy button held at power-on, U-Boot adds
+#   "factory_recovery"): a root on a USB stick is preferred.
+#
+# Every candidate partition is set read-only at the block layer and
+# mounted with "noload" while it is probed, so probing never writes to a
+# disk (no journal replay, no orphan cleanup), not even to RAID members.
+# Partitions with an md superblock (1.1 or 1.2, at the start) are skipped.
+# Only the partition that holds the root is made writable again.
+/bin/busybox --install -s /bin
+export PATH=/bin:/sbin
+mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
+log() { echo "[stage1 $(cut -d' ' -f1 /proc/uptime)] $*" > /dev/kmsg; echo "[stage1] $*" > /dev/console; }
+log "start; cmdline: $(cat /proc/cmdline)"
+
+disk_of() { case $1 in mmcblk*p*) echo ${1%p*};; *) echo $1 | sed 's/[0-9]*$//';; esac; }
+is_usb() { realpath /sys/block/$(disk_of $1)/device 2>/dev/null | grep -q '/usb'; }
+parts() { awk 'NR>2 && $4 ~ /^(sd[a-z]+[0-9]+|mmcblk0p[0-9]+)$/ {print $4}' /proc/partitions; }
+
+# md superblock 1.1 (offset 0) or 1.2 (offset 4096): magic a92b4efc, little endian
+printf '\374\116\053\251' > /tmp/md-magic
+is_md() {
+	for off in 0 4096; do
+		dd if=/dev/$1 of=/tmp/md-sb bs=1 skip=$off count=4 2>/dev/null
+		cmp -s /tmp/md-sb /tmp/md-magic && return 0
+	done
+	return 1
+}
+
+mkdir -p /newroot
+PROBED=""
+probe() {	# probe <partition> <kind>
+	[ -b /dev/$1 ] || return 1
+	is_md $1 && return 1
+	blockdev --setro /dev/$1 2>/dev/null && PROBED="$PROBED $1"
+	if mount -t ext4 -o ro,noload /dev/$1 /newroot 2>/dev/null; then
+		if [ "$(cat /newroot/etc/qnas-root 2>/dev/null)" = "QNAS-ROOT-v1" ] &&
+		   { [ -e /newroot/sbin/init ] || [ -L /newroot/sbin/init ]; }; then
+			umount /newroot
+			blockdev --setrw /dev/$1
+			# Mounted read-write here: the root needs no /etc/fstab entry,
+			# which would be ambiguous while a stick and the eMMC carry
+			# copies of the same image.
+			if mount -t ext4 -o rw,noatime,errors=remount-ro /dev/$1 /newroot; then
+				log "root on /dev/$1 ($2)"
+				return 0
+			fi
+			blockdev --setro /dev/$1
+		else
+			umount /newroot
+		fi
+	fi
+	return 1
+}
+try_internal() {
+	probe mmcblk0p7 internal && return 0
+	for n in $(parts); do
+		[ $n = mmcblk0p7 ] && continue
+		is_usb $n && continue
+		probe $n internal && return 0
+	done
+	return 1
+}
+try_usb() {
+	for n in $(parts); do
+		is_usb $n || continue
+		probe $n usb && return 0
+	done
+	return 1
+}
+
+found=""
+if grep -qw factory_recovery /proc/cmdline; then
+	log "recovery boot: looking for a USB root first"
+	for i in 1 2 3 4 5 6 7 8; do
+		if try_usb; then found=1; break; fi
+		sleep 1
+	done
+fi
+# Normal boot: internal storage only for the first 10 seconds.
+if [ -z "$found" ]; then
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		if try_internal; then found=1; break; fi
+		sleep 1
+	done
+fi
+# No internal root: keep looking, now also on USB (for example a rescue
+# stick plugged in later). There is no rescue login: the serial console has
+# no input, and a network login without credentials would be unsafe.
+if [ -z "$found" ]; then
+	log "no root found: plug in a rescue stick, or boot one with USB Copy held"
+	while :; do
+		if try_internal || try_usb; then found=1; break; fi
+		sleep 5
+	done
+fi
+# Give every other probed partition its normal writability back.
+for n in $PROBED; do [ -b /dev/$n ] && blockdev --setrw /dev/$n; done
+umount /sys; umount /proc; umount /dev 2>/dev/null
+exec switch_root /newroot /sbin/init

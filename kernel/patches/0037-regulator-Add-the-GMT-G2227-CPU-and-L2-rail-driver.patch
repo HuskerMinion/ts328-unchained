@@ -1,0 +1,456 @@
+From 7766bdd31d3f42667c69ceb843a985753897b09a Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 37/40] regulator: Add the GMT G2227 CPU and L2 rail driver
+
+Support the voltage of the CPU core (DCDC2, 0.8-1.1875 V in 12.5 mV
+steps) and CPU L2 (LDO3) rails of the G2227, for CPU voltage scaling on
+RTD129x boards. Register layout and tables are those of the vendor
+drivers (QNAP 4.2.8 gmt-g2227.c, Realtek BSP 4.9 g2227-regulator.c).
+
+The driver is deliberately narrow:
+- Only the two voltage registers are writable through regmap, and the
+  rails have no enable/disable operations, so nothing can be switched
+  off. Rails without a DT node are not registered.
+- The vendor code saw bad reads from this PMIC and retried them. Here a
+  read must return the same value twice; a register is written as a
+  whole byte, with the bits outside the voltage field taken from the
+  probe-time read (never a fresh read-modify-write), and read back.
+- LDO3 shares its register with LDO2 (1.8 V). The vendor driver forces
+  that field to 1.8 V; here LDO3 is only registered if it reads 1.8 V.
+- The boot loader settings of both rails are logged at probe.
+- After a raise the driver waits 100 us; the QNAP cpufreq driver waits
+  50 us.
+- At shutdown and reboot, a rail below its boot loader voltage is
+  raised back to it. Whether a reboot resets the PMIC is not known,
+  and the boot loader must not start below the voltage it set. cpufreq
+  keeps running until the very end of a reboot or power-off, so from
+  then on a voltage request below the boot voltage is raised to it
+  (clamped rather than failed, so cpufreq transitions keep working).
+  A driver mutex serializes the voltage writes with shutdown, since
+  shutdown does not go through the regulator core lock.
+---
+ drivers/regulator/Kconfig           |  10 +
+ drivers/regulator/Makefile          |   1 +
+ drivers/regulator/g2227-regulator.c | 379 ++++++++++++++++++++++++++++
+ 3 files changed, 390 insertions(+)
+ create mode 100644 drivers/regulator/g2227-regulator.c
+
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index d84f3d054..55e02a2be 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -440,6 +440,16 @@ config REGULATOR_FAN53880
+ 	  (PMIC), it is controlled by I2C and provides one BUCK, one BOOST
+ 	  and four LDO outputs.
+ 
++config REGULATOR_G2227
++	tristate "GMT G2227 PMIC CPU rails"
++	depends on I2C && OF
++	select REGMAP_I2C
++	help
++	  This driver supports the CPU core (DCDC2) and L2 cache (LDO3)
++	  rails of the GMT G2227 PMIC used with Realtek RTD129x SoCs, for
++	  CPU voltage scaling. The other rails are left as the boot loader
++	  set them.
++
+ config REGULATOR_GPIO
+ 	tristate "GPIO regulator support"
+ 	depends on GPIOLIB || COMPILE_TEST
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index b31013760..17c609250 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -52,6 +52,7 @@ obj-$(CONFIG_REGULATOR_DBX500_PRCMU) += dbx500-prcmu.o
+ obj-$(CONFIG_REGULATOR_DB8500_PRCMU) += db8500-prcmu.o
+ obj-$(CONFIG_REGULATOR_FAN53555) += fan53555.o
+ obj-$(CONFIG_REGULATOR_FAN53880) += fan53880.o
++obj-$(CONFIG_REGULATOR_G2227) += g2227-regulator.o
+ obj-$(CONFIG_REGULATOR_GPIO) += gpio-regulator.o
+ obj-$(CONFIG_REGULATOR_HI6421) += hi6421-regulator.o
+ obj-$(CONFIG_REGULATOR_HI6421V530) += hi6421v530-regulator.o
+diff --git a/drivers/regulator/g2227-regulator.c b/drivers/regulator/g2227-regulator.c
+new file mode 100644
+index 000000000..135e51230
+--- /dev/null
++++ b/drivers/regulator/g2227-regulator.c
+@@ -0,0 +1,379 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * GMT G2227 PMIC: SCPU core (DCDC2) and SCPU L2 (LDO3) rails
++ *
++ * Register layout and voltage tables from the Realtek vendor kernels
++ * (QNAP 4.2.8 gmt-g2227.c and Realtek BSP 4.9 g2227-regulator.c, by
++ * Simon Hsu and Cheng-Yu Lee). The latter is
++ * Copyright (C) 2016-2018 Realtek Semiconductor Corporation
++ * Copyright (C) 2016-2018 Cheng-Yu Lee <cylee12@realtek.com>
++ * Copyright (C) 2016 Simon Hsu <simon_hsu@realtek.com>
++ *
++ * Only the voltage of these two rails can be changed. The rails cannot be
++ * switched off, and every other register is left alone: regmap only lets
++ * the two voltage registers be written.
++ *
++ * The vendor code saw bad reads from this PMIC and retried them, so every
++ * read here must return the same value twice, a voltage register is
++ * written as a whole byte (the bits outside the voltage field are the
++ * ones read at probe, never a fresh read) and then read back.
++ *
++ * At shutdown and reboot, a rail that is below its boot loader voltage is
++ * raised back to it: it is not known whether a reboot resets the PMIC, and
++ * the boot loader must not start on a lower voltage than it set itself.
++ * cpufreq keeps running until the very end of a reboot or power-off, so
++ * from then on no rail is set below its boot loader voltage again.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++
++#define G2227_REG_DCDC2_NRMVOLT		0x10
++#define  G2227_DCDC2_VSEL		GENMASK(4, 0)
++#define G2227_REG_LDO_NRMVOLT		0x14
++#define  G2227_LDO2_VSEL		GENMASK(7, 4)
++#define  G2227_LDO3_VSEL		GENMASK(3, 0)
++#define G2227_REG_VERSION		0x20
++#define  G2227_CHIP_ID			GENMASK(7, 3)
++#define  G2227_VERSION			GENMASK(2, 0)
++
++/* LDO2 shares the LDO3 register; the vendor code insists on 1.8 V */
++#define G2227_LDO2_SEL_1V8		0xa
++
++#define G2227_READ_TRIES		5
++/* The QNAP 4.2.8 cpufreq driver waits 50 us after raising the voltage */
++#define G2227_RAISE_SETTLE_US		100
++
++enum g2227_rail {
++	G2227_DCDC2,
++	G2227_LDO3,
++	G2227_NUM_RAILS,
++};
++
++struct g2227 {
++	struct device *dev;
++	struct regmap *regmap;
++	/* Bits outside the voltage field of each rail, read at probe */
++	unsigned int keep[G2227_NUM_RAILS];
++	/* Boot loader voltage selector of each registered rail */
++	unsigned int boot_sel[G2227_NUM_RAILS];
++	struct regulator_dev *rdev[G2227_NUM_RAILS];
++	/*
++	 * Serializes voltage writes with shutdown. The regulator core lock
++	 * is not available to drivers, and shutdown does not go through it.
++	 */
++	struct mutex lock;
++	/* Set at shutdown: keep every rail at or above its boot voltage */
++	bool shutting_down;
++};
++
++static const unsigned int g2227_dcdc_volt_table[] = {
++	 800000,  812500,  825000,  837500,  850000,  862500,  875000,  887500,
++	 900000,  912500,  925000,  937500,  950000,  962500,  975000,  987500,
++	1000000, 1012500, 1025000, 1037500, 1050000, 1062500, 1075000, 1087500,
++	1100000, 1112500, 1125000, 1137500, 1150000, 1162500, 1175000, 1187500,
++};
++
++static const unsigned int g2227_ldo_volt_table[] = {
++	 800000,  850000,  900000,  950000, 1000000, 1100000, 1200000, 1300000,
++	1500000, 1600000, 1800000, 1900000, 2500000, 2600000, 3000000, 3100000,
++};
++
++static bool g2227_writeable_reg(struct device *dev, unsigned int reg)
++{
++	return reg == G2227_REG_DCDC2_NRMVOLT || reg == G2227_REG_LDO_NRMVOLT;
++}
++
++static const struct regmap_config g2227_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = G2227_REG_VERSION,
++	.writeable_reg = g2227_writeable_reg,
++	.cache_type = REGCACHE_NONE,
++};
++
++static int g2227_read(struct g2227 *pmic, unsigned int reg, unsigned int *val)
++{
++	unsigned int prev, cur;
++	int i, ret;
++
++	ret = regmap_read(pmic->regmap, reg, &prev);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < G2227_READ_TRIES; i++) {
++		ret = regmap_read(pmic->regmap, reg, &cur);
++		if (ret)
++			return ret;
++		if (cur == prev) {
++			*val = cur;
++			return 0;
++		}
++		prev = cur;
++	}
++
++	dev_err(pmic->dev, "register %#04x reads are unstable\n", reg);
++	return -EIO;
++}
++
++static int g2227_get_voltage_sel(struct regulator_dev *rdev)
++{
++	struct g2227 *pmic = rdev_get_drvdata(rdev);
++	const struct regulator_desc *desc = rdev->desc;
++	unsigned int val;
++	int ret;
++
++	ret = g2227_read(pmic, desc->vsel_reg, &val);
++	if (ret)
++		return ret;
++
++	return (val & desc->vsel_mask) >> (ffs(desc->vsel_mask) - 1);
++}
++
++/* Called with pmic->lock held */
++static int g2227_write_sel(struct g2227 *pmic, struct regulator_dev *rdev,
++			   unsigned int sel)
++{
++	const struct regulator_desc *desc = rdev->desc;
++	unsigned int want, val;
++	int ret;
++
++	want = pmic->keep[desc->id] |
++	       ((sel << (ffs(desc->vsel_mask) - 1)) & desc->vsel_mask);
++
++	ret = regmap_write(pmic->regmap, desc->vsel_reg, want);
++	if (ret)
++		return ret;
++
++	ret = g2227_read(pmic, desc->vsel_reg, &val);
++	if (ret)
++		return ret;
++
++	if (val != want) {
++		dev_err(pmic->dev, "%s: wrote %#04x, read back %#04x\n",
++			desc->name, want, val);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int g2227_set_voltage_sel(struct regulator_dev *rdev, unsigned int sel)
++{
++	struct g2227 *pmic = rdev_get_drvdata(rdev);
++	int ret;
++
++	mutex_lock(&pmic->lock);
++	/* Too late to lower the voltage: the boot loader may run next */
++	if (pmic->shutting_down)
++		sel = max(sel, pmic->boot_sel[rdev->desc->id]);
++	ret = g2227_write_sel(pmic, rdev, sel);
++	mutex_unlock(&pmic->lock);
++
++	return ret;
++}
++
++static int g2227_set_voltage_time_sel(struct regulator_dev *rdev,
++				      unsigned int old_sel,
++				      unsigned int new_sel)
++{
++	/* Both voltage tables are ascending */
++	return new_sel > old_sel ? G2227_RAISE_SETTLE_US : 0;
++}
++
++static const struct regulator_ops g2227_ops = {
++	.list_voltage = regulator_list_voltage_table,
++	.map_voltage = regulator_map_voltage_ascend,
++	.get_voltage_sel = g2227_get_voltage_sel,
++	.set_voltage_sel = g2227_set_voltage_sel,
++	.set_voltage_time_sel = g2227_set_voltage_time_sel,
++};
++
++static const struct regulator_desc g2227_regulators[G2227_NUM_RAILS] = {
++	[G2227_DCDC2] = {
++		.name = "dcdc2",
++		.of_match = "dcdc2",
++		.regulators_node = "regulators",
++		.id = G2227_DCDC2,
++		.type = REGULATOR_VOLTAGE,
++		.owner = THIS_MODULE,
++		.ops = &g2227_ops,
++		.volt_table = g2227_dcdc_volt_table,
++		.n_voltages = ARRAY_SIZE(g2227_dcdc_volt_table),
++		.vsel_reg = G2227_REG_DCDC2_NRMVOLT,
++		.vsel_mask = G2227_DCDC2_VSEL,
++	},
++	[G2227_LDO3] = {
++		.name = "ldo3",
++		.of_match = "ldo3",
++		.regulators_node = "regulators",
++		.id = G2227_LDO3,
++		.type = REGULATOR_VOLTAGE,
++		.owner = THIS_MODULE,
++		.ops = &g2227_ops,
++		.volt_table = g2227_ldo_volt_table,
++		.n_voltages = ARRAY_SIZE(g2227_ldo_volt_table),
++		.vsel_reg = G2227_REG_LDO_NRMVOLT,
++		.vsel_mask = G2227_LDO3_VSEL,
++	},
++};
++
++static int g2227_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct regulator_config config = {};
++	struct device_node *regs_np;
++	struct g2227 *pmic;
++	unsigned int val;
++	int i, ret;
++
++	pmic = devm_kzalloc(dev, sizeof(*pmic), GFP_KERNEL);
++	if (!pmic)
++		return -ENOMEM;
++
++	pmic->dev = dev;
++	ret = devm_mutex_init(dev, &pmic->lock);
++	if (ret)
++		return ret;
++
++	pmic->regmap = devm_regmap_init_i2c(client, &g2227_regmap_config);
++	if (IS_ERR(pmic->regmap))
++		return dev_err_probe(dev, PTR_ERR(pmic->regmap),
++				     "regmap init failed\n");
++
++	ret = g2227_read(pmic, G2227_REG_VERSION, &val);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot read the version\n");
++
++	dev_info(dev, "G2227 chip id %lu, version %lu\n",
++		 FIELD_GET(G2227_CHIP_ID, val), FIELD_GET(G2227_VERSION, val));
++
++	/* Report the boot loader settings, described in DT or not */
++	for (i = 0; i < G2227_NUM_RAILS; i++) {
++		const struct regulator_desc *desc = &g2227_regulators[i];
++		unsigned int sel;
++
++		ret = g2227_read(pmic, desc->vsel_reg, &val);
++		if (ret)
++			return ret;
++
++		sel = (val & desc->vsel_mask) >> (ffs(desc->vsel_mask) - 1);
++		dev_info(dev, "%s: %u uV (register %#04x = %#04x)\n",
++			 desc->name, desc->volt_table[sel], desc->vsel_reg, val);
++	}
++
++	regs_np = of_get_child_by_name(dev->of_node, "regulators");
++	if (!regs_np)
++		return dev_err_probe(dev, -ENODEV, "no regulators node\n");
++
++	config.dev = dev;
++	config.driver_data = pmic;
++	config.regmap = pmic->regmap;
++
++	for (i = 0; i < G2227_NUM_RAILS; i++) {
++		const struct regulator_desc *desc = &g2227_regulators[i];
++		struct device_node *np;
++		struct regulator_dev *rdev;
++
++		/* Rails without a node are not touched */
++		np = of_get_child_by_name(regs_np, desc->of_match);
++		if (!np)
++			continue;
++		of_node_put(np);
++
++		ret = g2227_read(pmic, desc->vsel_reg, &val);
++		if (ret)
++			goto out;
++
++		pmic->keep[i] = val & ~desc->vsel_mask;
++		pmic->boot_sel[i] = (val & desc->vsel_mask) >>
++				    (ffs(desc->vsel_mask) - 1);
++
++		if (i == G2227_LDO3 &&
++		    FIELD_GET(G2227_LDO2_VSEL, val) != G2227_LDO2_SEL_1V8) {
++			dev_err(dev, "ldo2 is not at 1.8 V, not registering ldo3\n");
++			continue;
++		}
++
++		rdev = devm_regulator_register(dev, desc, &config);
++		if (IS_ERR(rdev)) {
++			ret = dev_err_probe(dev, PTR_ERR(rdev),
++					    "failed to register %s\n",
++					    desc->name);
++			goto out;
++		}
++		pmic->rdev[i] = rdev;
++	}
++
++	i2c_set_clientdata(client, pmic);
++	ret = 0;
++out:
++	of_node_put(regs_np);
++	return ret;
++}
++
++static void g2227_shutdown(struct i2c_client *client)
++{
++	struct g2227 *pmic = i2c_get_clientdata(client);
++	int i, sel;
++
++	if (!pmic)
++		return;
++
++	mutex_lock(&pmic->lock);
++	pmic->shutting_down = true;
++
++	for (i = 0; i < G2227_NUM_RAILS; i++) {
++		struct regulator_dev *rdev = pmic->rdev[i];
++
++		if (!rdev)
++			continue;
++
++		/* Never write when the current voltage is not known */
++		sel = g2227_get_voltage_sel(rdev);
++		if (sel < 0 || sel >= pmic->boot_sel[i])
++			continue;
++
++		dev_info(pmic->dev, "%s: back to the boot voltage, %u uV\n",
++			 rdev->desc->name,
++			 rdev->desc->volt_table[pmic->boot_sel[i]]);
++		if (!g2227_write_sel(pmic, rdev, pmic->boot_sel[i]))
++			udelay(G2227_RAISE_SETTLE_US);
++	}
++
++	mutex_unlock(&pmic->lock);
++}
++
++static const struct of_device_id g2227_of_match[] = {
++	{ .compatible = "gmt,g2227" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, g2227_of_match);
++
++static const struct i2c_device_id g2227_id[] = {
++	{ "g2227" },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, g2227_id);
++
++static struct i2c_driver g2227_driver = {
++	.driver = {
++		.name = "g2227",
++		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++		.of_match_table = g2227_of_match,
++	},
++	.probe = g2227_probe,
++	.shutdown = g2227_shutdown,
++	.id_table = g2227_id,
++};
++module_i2c_driver(g2227_driver);
++
++MODULE_DESCRIPTION("GMT G2227 PMIC regulator driver");
++MODULE_LICENSE("GPL");

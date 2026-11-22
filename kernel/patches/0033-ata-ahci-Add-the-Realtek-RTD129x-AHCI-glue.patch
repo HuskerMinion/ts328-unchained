@@ -1,0 +1,409 @@
+From a935a349ad23440c437dd2436b5668142066ae63 Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 33/40] ata: ahci: Add the Realtek RTD129x AHCI glue
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add an ahci_platform glue for the two-port AHCI SATA controller of the
+Realtek RTD1293/RTD1295/RTD1296 SoCs.
+
+For each port the glue sets the CRT clock gates if the boot loader left
+them off (there is no clock driver yet), holds the port MAC and the PHY
+in reset for 100 ms, powers the PHY on and repeats the MAC setup of the
+vendor kernels (QNAP 4.2.8 config_sata_mac(), also in the BSP U-Boot):
+HBA capabilities, ports implemented, per-port vendor registers and
+PxCMD spin-up. libahci then resets and starts the HBA as usual.
+
+Port multiplier support is turned off, as in the vendor kernels (QNAP
+"bug#120470"), and with it FBS.
+
+Based on the vendor drivers (QNAP 4.2.8, Realtek BSP 4.9, Synology 4.4)
+and on Andreas Färber's WIP ahci_rtd1295.c.
+---
+ drivers/ata/Kconfig        |  12 ++
+ drivers/ata/Makefile       |   1 +
+ drivers/ata/ahci_rtd129x.c | 338 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 351 insertions(+)
+ create mode 100644 drivers/ata/ahci_rtd129x.c
+
+diff --git a/drivers/ata/Kconfig b/drivers/ata/Kconfig
+index ff81f707d..ce5b0cebf 100644
+--- a/drivers/ata/Kconfig
++++ b/drivers/ata/Kconfig
+@@ -242,6 +242,18 @@ config AHCI_MTK
+ 
+ 	  If unsure, say N.
+ 
++config AHCI_RTD129X
++	tristate "Realtek RTD1295/RTD1296 AHCI SATA support"
++	depends on ARCH_REALTEK || COMPILE_TEST
++	select MFD_SYSCON
++	select SATA_HOST
++	help
++	  This option enables support for the onboard two-port AHCI SATA
++	  controller of the Realtek RTD1293, RTD1295 and RTD1296 SoCs.
++	  It needs the RTD129x SATA PHY driver (PHY_RTK_RTD129X_SATA).
++
++	  If unsure, say N.
++
+ config AHCI_MVEBU
+ 	tristate "Marvell EBU AHCI SATA support"
+ 	depends on ARCH_MVEBU || COMPILE_TEST
+diff --git a/drivers/ata/Makefile b/drivers/ata/Makefile
+index 81e04e96b..f5b27e038 100644
+--- a/drivers/ata/Makefile
++++ b/drivers/ata/Makefile
+@@ -20,6 +20,7 @@ obj-$(CONFIG_AHCI_DWC)		+= ahci_dwc.o libahci.o libahci_platform.o
+ obj-$(CONFIG_AHCI_IMX)		+= ahci_imx.o libahci.o libahci_platform.o
+ obj-$(CONFIG_AHCI_MTK)		+= ahci_mtk.o libahci.o libahci_platform.o
+ obj-$(CONFIG_AHCI_MVEBU)	+= ahci_mvebu.o libahci.o libahci_platform.o
++obj-$(CONFIG_AHCI_RTD129X)	+= ahci_rtd129x.o libahci.o libahci_platform.o
+ obj-$(CONFIG_AHCI_OCTEON)	+= ahci_octeon.o
+ obj-$(CONFIG_AHCI_SUNXI)	+= ahci_sunxi.o libahci.o libahci_platform.o
+ obj-$(CONFIG_AHCI_ST)		+= ahci_st.o libahci.o libahci_platform.o
+diff --git a/drivers/ata/ahci_rtd129x.c b/drivers/ata/ahci_rtd129x.c
+new file mode 100644
+index 000000000..3165d0494
+--- /dev/null
++++ b/drivers/ata/ahci_rtd129x.c
+@@ -0,0 +1,338 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Realtek RTD1295/RTD1296 AHCI SATA glue
++ *
++ * The SoC has a two-port AHCI controller with a Realtek wrapper. The boot
++ * loader may leave it unconfigured, so the glue releases the port resets,
++ * sets the clock gates and repeats the vendor MAC setup before handing the
++ * controller to libahci. The PHYs are programmed by phy-rtd129x-sata.
++ *
++ * Based on the Realtek vendor kernels (QNAP 4.2.8 ahci_rtk.c, Realtek BSP
++ * 4.9 and Synology 4.4) and on Andreas Färber's WIP ahci_rtd1295.c.
++ */
++
++#include <linux/ahci_platform.h>
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/libata.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/reset.h>
++
++#include "ahci.h"
++
++#define DRV_NAME			"ahci-rtd129x"
++
++#define RTD129X_AHCI_NUM_PORTS		2
++
++/*
++ * Vendor HBA capabilities: 2 ports, NCQ, SNTF, PMP, FBS, Gen3, partial and
++ * slumber; no staggered spin-up, so the device is spun up through PxCMD.SUD.
++ */
++#define RTD129X_CAP_STAGE1		0x6726ff81
++#define RTD129X_CAP			0x6737ff81
++
++/* Command completion coalescing, AHCI 1.3 */
++#define RTD129X_HOST_CCC_CTL		0x14
++#define RTD129X_HOST_CCC_CTL_EN		BIT(0)
++#define RTD129X_HOST_CCC_PORTS		0x18
++
++/* Vendor-specific registers */
++#define RTD129X_HOST_A4			0x0a4
++#define RTD129X_HOST_A4_VAL		0x700
++#define RTD129X_SATA_CTR		0xf20
++#define RTD129X_SATA_CTR_VAL		0x3c300	/* CKBUF_EN0/1, MAC RX error select */
++#define RTD129X_PORT_70			0x70
++#define RTD129X_PORT_70_VAL		0x88
++
++/* The vendor code waits 1 ms after every MAC register write */
++#define RTD129X_MAC_DELAY_US		1000
++/* Ports and PHYs are held in reset this long, as in the vendor code */
++#define RTD129X_RESET_MS		100
++
++struct rtd129x_ahci_port_clk {
++	unsigned int reg;
++	u32 mask;
++};
++
++/* CRT clock gates: clk_en_sata_N and clk_en_sata_alive_N */
++static const struct rtd129x_ahci_port_clk rtd129x_ahci_clks[] = {
++	{ 0x0c, BIT(2) | BIT(7) },
++	{ 0x10, BIT(25) | BIT(26) },
++};
++
++struct rtd129x_ahci {
++	struct device *dev;
++	struct regmap *crt;
++	struct reset_control *rst[RTD129X_AHCI_NUM_PORTS];
++	unsigned int ports_up;
++};
++
++static void rtd129x_ahci_writel(u32 val, void __iomem *addr)
++{
++	writel(val, addr);
++	fsleep(RTD129X_MAC_DELAY_US);
++}
++
++static int rtd129x_ahci_enable_clk(struct rtd129x_ahci *priv,
++				   unsigned int port)
++{
++	const struct rtd129x_ahci_port_clk *clk = &rtd129x_ahci_clks[port];
++	u32 val;
++	int ret;
++
++	/* No clock driver yet: set the gates when the boot loader did not */
++	if (!priv->crt)
++		return 0;
++
++	ret = regmap_read(priv->crt, clk->reg, &val);
++	if (ret)
++		return ret;
++
++	if ((val & clk->mask) == clk->mask)
++		return 0;
++
++	dev_info(priv->dev, "port %u: enabling clock gates in CRT %#x\n",
++		 port, clk->reg);
++
++	return regmap_set_bits(priv->crt, clk->reg, clk->mask);
++}
++
++/* QNAP 4.2.8 config_sata_mac(), the speed setting is done by the PHY */
++static void rtd129x_ahci_mac_init(struct ahci_host_priv *hpriv,
++				  unsigned int port)
++{
++	void __iomem *mmio = hpriv->mmio;
++	void __iomem *port_mmio = mmio + 0x100 + port * 0x80;
++	u32 val;
++
++	rtd129x_ahci_writel(RTD129X_CAP_STAGE1, mmio + HOST_CAP);
++	readl(mmio + HOST_CAP);
++	rtd129x_ahci_writel(RTD129X_CAP, mmio + HOST_CAP);
++	readl(mmio + HOST_CAP);
++
++	rtd129x_ahci_writel(HOST_AHCI_EN | HOST_RESET, mmio + HOST_CTL);
++	rtd129x_ahci_writel(HOST_AHCI_EN | HOST_IRQ_EN, mmio + HOST_CTL);
++
++	val = readl(mmio + RTD129X_HOST_CCC_CTL);
++	rtd129x_ahci_writel(val & ~RTD129X_HOST_CCC_CTL_EN,
++			    mmio + RTD129X_HOST_CCC_CTL);
++	val = readl(mmio + HOST_PORTS_IMPL);
++	rtd129x_ahci_writel(val | GENMASK(RTD129X_AHCI_NUM_PORTS - 1, 0),
++			    mmio + HOST_PORTS_IMPL);
++	/* Sic: the vendor code ORs in port << 1, not BIT(port) */
++	val = readl(mmio + RTD129X_HOST_CCC_PORTS);
++	rtd129x_ahci_writel(val | (port << 1), mmio + RTD129X_HOST_CCC_PORTS);
++
++	rtd129x_ahci_writel(0xffffffff, port_mmio + PORT_IRQ_MASK);
++	rtd129x_ahci_writel(RTD129X_PORT_70_VAL, port_mmio + RTD129X_PORT_70);
++	/*
++	 * Vendor values 0x10 and 0x4016. FIS receive is enabled before
++	 * libahci sets PxFB; the vendor kernels do the same, and libahci
++	 * resets the HBA before it uses the port.
++	 */
++	rtd129x_ahci_writel(PORT_CMD_FIS_RX, port_mmio + PORT_CMD);
++	rtd129x_ahci_writel(PORT_CMD_FIS_ON | PORT_CMD_FIS_RX |
++			    PORT_CMD_POWER_ON | PORT_CMD_SPIN_UP,
++			    port_mmio + PORT_CMD);
++	rtd129x_ahci_writel(0xf000, port_mmio + PORT_FBS);
++
++	rtd129x_ahci_writel(RTD129X_SATA_CTR_VAL, mmio + RTD129X_SATA_CTR);
++	rtd129x_ahci_writel(RTD129X_HOST_A4_VAL, mmio + RTD129X_HOST_A4);
++}
++
++static void rtd129x_ahci_port_down(struct ahci_host_priv *hpriv,
++				   unsigned int port)
++{
++	struct rtd129x_ahci *priv = hpriv->plat_data;
++
++	if (!(priv->ports_up & BIT(port)))
++		return;
++
++	phy_power_off(hpriv->phys[port]);
++	phy_exit(hpriv->phys[port]);
++	reset_control_assert(priv->rst[port]);
++	priv->ports_up &= ~BIT(port);
++}
++
++static int rtd129x_ahci_port_up(struct ahci_host_priv *hpriv,
++				unsigned int port)
++{
++	struct rtd129x_ahci *priv = hpriv->plat_data;
++	struct phy *phy = hpriv->phys[port];
++	int ret;
++
++	if (!phy)
++		return dev_err_probe(priv->dev, -ENODEV,
++				     "port %u: no PHY\n", port);
++
++	ret = rtd129x_ahci_enable_clk(priv, port);
++	if (ret)
++		return ret;
++
++	/* MAC and PHY in reset together, as in the vendor code */
++	ret = reset_control_assert(priv->rst[port]);
++	if (ret)
++		return ret;
++
++	ret = phy_init(phy);
++	if (ret)
++		return ret;
++
++	msleep(RTD129X_RESET_MS);
++
++	ret = reset_control_deassert(priv->rst[port]);
++	if (ret)
++		goto err_exit;
++
++	ret = phy_set_mode(phy, PHY_MODE_SATA);
++	if (ret)
++		goto err_rst;
++
++	ret = phy_power_on(phy);
++	if (ret)
++		goto err_rst;
++
++	rtd129x_ahci_mac_init(hpriv, port);
++	priv->ports_up |= BIT(port);
++
++	return 0;
++
++err_rst:
++	reset_control_assert(priv->rst[port]);
++err_exit:
++	phy_exit(phy);
++	return ret;
++}
++
++static void rtd129x_ahci_disable(struct ahci_host_priv *hpriv)
++{
++	unsigned int i;
++
++	for (i = 0; i < RTD129X_AHCI_NUM_PORTS; i++)
++		rtd129x_ahci_port_down(hpriv, i);
++
++	ahci_platform_disable_clks(hpriv);
++	ahci_platform_disable_regulators(hpriv);
++}
++
++static void rtd129x_ahci_host_stop(struct ata_host *host)
++{
++	rtd129x_ahci_disable(host->private_data);
++}
++
++static struct ata_port_operations rtd129x_ahci_port_ops = {
++	.inherits	= &ahci_platform_ops,
++	.host_stop	= rtd129x_ahci_host_stop,
++};
++
++static const struct ata_port_info rtd129x_ahci_port_info = {
++	.flags		= AHCI_FLAG_COMMON,
++	.pio_mask	= ATA_PIO4,
++	.udma_mask	= ATA_UDMA6,
++	.port_ops	= &rtd129x_ahci_port_ops,
++};
++
++static const struct scsi_host_template rtd129x_ahci_sht = {
++	AHCI_SHT(DRV_NAME),
++};
++
++static int rtd129x_ahci_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct ahci_host_priv *hpriv;
++	struct rtd129x_ahci *priv;
++	unsigned int i;
++	int ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = dev;
++
++	priv->crt = syscon_regmap_lookup_by_phandle_optional(dev->of_node,
++							     "realtek,crt-syscon");
++	if (IS_ERR(priv->crt))
++		return dev_err_probe(dev, PTR_ERR(priv->crt),
++				     "bad CRT syscon\n");
++
++	for (i = 0; i < RTD129X_AHCI_NUM_PORTS; i++) {
++		char name[8];
++
++		snprintf(name, sizeof(name), "sata%u", i);
++		priv->rst[i] = devm_reset_control_get_optional_exclusive(dev,
++									 name);
++		if (IS_ERR(priv->rst[i]))
++			return dev_err_probe(dev, PTR_ERR(priv->rst[i]),
++					     "bad %s reset\n", name);
++	}
++
++	hpriv = ahci_platform_get_resources(pdev, 0);
++	if (IS_ERR(hpriv))
++		return PTR_ERR(hpriv);
++
++	hpriv->plat_data = priv;
++	/*
++	 * The vendor kernels turn port multiplier support off on these
++	 * SoCs (QNAP "bug#120470"); FBS is only useful with a PMP.
++	 */
++	hpriv->flags |= AHCI_HFLAG_NO_PMP | AHCI_HFLAG_NO_FBS;
++
++	ret = ahci_platform_enable_regulators(hpriv);
++	if (ret)
++		return ret;
++
++	ret = ahci_platform_enable_clks(hpriv);
++	if (ret)
++		goto err_regulators;
++
++	for (i = 0; i < RTD129X_AHCI_NUM_PORTS; i++) {
++		if (ahci_ignore_port(hpriv, i))
++			continue;
++
++		ret = rtd129x_ahci_port_up(hpriv, i);
++		if (ret)
++			goto err_disable;
++	}
++
++	ret = ahci_platform_init_host(pdev, hpriv, &rtd129x_ahci_port_info,
++				      &rtd129x_ahci_sht);
++	if (ret)
++		goto err_disable;
++
++	return 0;
++
++err_disable:
++	rtd129x_ahci_disable(hpriv);
++	return ret;
++
++err_regulators:
++	ahci_platform_disable_regulators(hpriv);
++	return ret;
++}
++
++static const struct of_device_id rtd129x_ahci_of_match[] = {
++	{ .compatible = "realtek,rtd1295-ahci" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rtd129x_ahci_of_match);
++
++static struct platform_driver rtd129x_ahci_driver = {
++	.probe		= rtd129x_ahci_probe,
++	.remove		= ata_platform_remove_one,
++	.shutdown	= ahci_platform_shutdown,
++	.driver		= {
++		.name		= DRV_NAME,
++		.of_match_table	= rtd129x_ahci_of_match,
++	},
++};
++module_platform_driver(rtd129x_ahci_driver);
++
++MODULE_DESCRIPTION("Realtek RTD1295/RTD1296 AHCI SATA driver");
++MODULE_LICENSE("GPL");

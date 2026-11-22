@@ -1,0 +1,1027 @@
+From b928d7adc1e438b1f5d835e19173cc24ead24a7c Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 29/40] ALSA: arm: Add Realtek RTD1295 audio CPU playback
+ driver
+
+The RTD129x audio outputs are driven by the audio CPU firmware. Add a
+single playback PCM that follows the QNAP/Realtek vendor ALSA driver
+(snd-realtek.c without AO_ON_SCPU): the ALSA buffer is the input ring of
+a firmware LPCM decoder, which feeds a "flash" input pin of the firmware
+audio output through one ring per channel.
+
+Setup and teardown are firmware RPCs (create AO and decoder, get/release
+the flash pin, init rings, connect, pause/run/stop/flush/destroy, new
+format in-band command). Streaming needs no RPC: an hrtimer hands the
+application's data to the decoder by moving the ring write pointer and
+reads the decoder's read pointer back as the position. Data handed to
+the audio CPU cannot be taken back, so rewinds are not allowed
+(SNDRV_PCM_INFO_NO_REWINDS). On drain the
+decoder gets an EOS in-band command; on close the driver waits for the
+AO to play what was decoded.
+
+S16_LE stereo at 44.1/48 kHz only; alsa-lib converts the rest. All
+shared memory comes from a no-map reserved pool below 512 MiB (the
+audio CPU's KSEG1 window), instead of the vendor ION heap. An optional
+GPIO enables the speaker amplifier while the PCM is open (or always,
+with amp_always_on, as the vendor driver does), and there is a 0..31
+master volume.
+
+SND_ARM is allowed on ARM64 so that the driver can live with the other
+ARM SoC drivers.
+---
+ sound/arm/Kconfig      |  14 +-
+ sound/arm/Makefile     |   3 +
+ sound/arm/rtd1295-ao.c | 940 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 956 insertions(+), 1 deletion(-)
+ create mode 100644 sound/arm/rtd1295-ao.c
+
+diff --git a/sound/arm/Kconfig b/sound/arm/Kconfig
+index dea2c661b..b0ae96281 100644
+--- a/sound/arm/Kconfig
++++ b/sound/arm/Kconfig
+@@ -3,7 +3,7 @@
+ 
+ menuconfig SND_ARM
+ 	bool "ARM sound devices"
+-	depends on ARM
++	depends on ARM || ARM64
+ 	default y
+ 	help
+ 	  Support for sound devices specific to ARM architectures.
+@@ -28,6 +28,18 @@ config SND_PXA2XX_AC97
+ 	  Say Y or M if you want to support any AC97 codec attached to
+ 	  the PXA2xx AC97 interface.
+ 
++config SND_RTD1295_AO
++	tristate "Realtek RTD1295 audio CPU playback"
++	depends on RTD1295_RPC
++	select SND_PCM
++	help
++	  PCM playback on Realtek RTD1293/RTD1295/RTD1296 SoCs through the
++	  audio CPU firmware, which drives the analog, HDMI and S/PDIF
++	  outputs. One stereo 16-bit stream at 44.1 or 48 kHz.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called snd-rtd1295-ao.
++
+ endif	# SND_ARM
+ 
+ config SND_PXA2XX_LIB
+diff --git a/sound/arm/Makefile b/sound/arm/Makefile
+index 899edb4bb..987db9db5 100644
+--- a/sound/arm/Makefile
++++ b/sound/arm/Makefile
+@@ -12,3 +12,6 @@ snd-pxa2xx-lib-$(CONFIG_SND_PXA2XX_LIB_AC97)	+= pxa2xx-ac97-lib.o
+ 
+ obj-$(CONFIG_SND_PXA2XX_AC97)	+= snd-pxa2xx-ac97.o
+ snd-pxa2xx-ac97-y		:= pxa2xx-ac97.o
++
++obj-$(CONFIG_SND_RTD1295_AO)	+= snd-rtd1295-ao.o
++snd-rtd1295-ao-y		:= rtd1295-ao.o
+diff --git a/sound/arm/rtd1295-ao.c b/sound/arm/rtd1295-ao.c
+new file mode 100644
+index 000000000..30e52814a
+--- /dev/null
++++ b/sound/arm/rtd1295-ao.c
+@@ -0,0 +1,940 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Realtek RTD1295/RTD1296 PCM playback through the audio CPU firmware
++ *
++ * The audio outputs (analog DAC, HDMI, S/PDIF) are driven by the audio CPU
++ * firmware. Playback follows the QNAP/Realtek vendor ALSA driver
++ * (sound/arm/snd-realtek.c, built without AO_ON_SCPU):
++ *
++ *   ALSA buffer --> LPCM decoder instance --> one ring per channel
++ *               --> "flash" input pin of the firmware audio output (AO)
++ *
++ * The ALSA buffer itself is the decoder's input ring. A timer moves the
++ * ring's write pointer up to the application pointer and reads the
++ * decoder's read pointer back as the hardware position; no RPC is needed
++ * while streaming. Everything the firmware reads lives in a reserved
++ * non-cached pool below 512 MiB. Shared structures are big endian.
++ *
++ * One format: S16_LE stereo at 44.1 or 48 kHz. alsa-lib converts the rest.
++ *
++ * Based on that vendor driver, which in the QNAP 4.2.8 kernel is
++ * Copyright (C) 2007-2014 Realtek Semiconductor Corporation.
++ */
++
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/gpio/consumer.h>
++#include <linux/hrtimer.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/soc/realtek/rtd1295-rpc.h>
++#include <linux/spinlock.h>
++
++#include <sound/control.h>
++#include <sound/core.h>
++#include <sound/initval.h>
++#include <sound/pcm.h>
++
++/* Firmware kernel-RPC commands (ENUM_KERNEL_RPC_*) */
++#define AO_CMD_CREATE_AGENT		0
++#define AO_CMD_INIT_RINGBUF		1
++#define AO_CMD_PRIVATEINFO		2
++#define AO_CMD_RUN			3
++#define AO_CMD_PAUSE			4
++#define AO_CMD_VOLUME_CONTROL		7
++#define AO_CMD_FLUSH			8
++#define AO_CMD_CONNECT			9
++#define AO_CMD_DESTROY			18
++#define AO_CMD_STOP			19
++#define AO_CMD_CHECK_READY		20
++
++/* Instance types (AUDIO_MODULE_TYPE) */
++#define AO_TYPE_ALSA_OUT		12
++#define AO_TYPE_DECODER			16
++
++/* Pins (AUDIO_IO_PIN) */
++#define AO_PIN_BASE_BS_IN		0
++#define AO_PIN_PCM_OUT			5
++#define AO_PIN_INBAND_QUEUE		9
++#define AO_PIN_FLASH_FIRST		15
++#define AO_PIN_FLASH_LAST		17
++
++/* PRIVATEINFO types */
++#define AO_PRIV_GET_FLASH_PIN		6
++#define AO_PRIV_RELEASE_FLASH_PIN	7
++
++#define AO_CONFIG_CMD_VOLUME		3
++#define AO_VOLUME_MAX			31
++
++/* Decoder in-band commands */
++#define AO_INBAND_NEW_FORMAT		2
++#define AO_INBAND_EOS			3
++#define AO_DEC_LPCM			3
++#define AO_PCM_LITTLE_ENDIAN		1
++#define AO_RING_STREAM			0
++
++#define AO_CHANNELS			2
++#define AO_BUFFER_MAX			SZ_64K
++#define AO_OUT_RING_SIZE		(6 * 1024)	/* QNAP RTK_DEC_AO_BUFFER_SIZE */
++#define AO_INBAND_WORDS			64
++#define AO_SCRATCH_SIZE			SZ_4K
++#define AO_READY_TRIES			10
++#define AO_DRAIN_TIMEOUT_MS		500
++
++static bool amp_always_on;
++module_param(amp_always_on, bool, 0444);
++MODULE_PARM_DESC(amp_always_on, "Keep the speaker amplifier on, as the vendor driver does");
++
++/* RINGBUFFER_HEADER, shared with the firmware, big endian */
++struct ao_ring_hdr {
++	__be32 magic;
++	__be32 begin;
++	__be32 size;
++	__be32 buffer_id;
++	__be32 wp;
++	__be32 num_rp;
++	__be32 reserved[2];
++	__be32 rp[4];
++	__be32 file_offset;
++	__be32 req_file_offset;
++	__be32 file_size;
++	__be32 seekable;
++};
++
++struct ao_shm {
++	struct ao_ring_hdr in;			/* decoder input: ALSA buffer */
++	struct ao_ring_hdr inband;		/* decoder in-band commands */
++	struct ao_ring_hdr out[AO_CHANNELS];	/* decoder to AO */
++	__be32 inband_data[AO_INBAND_WORDS];
++};
++
++struct rtd_ao {
++	struct device *dev;
++	struct rtd1295_rpc *rpc;
++	struct gpio_desc *amp;
++
++	struct mutex lock;	/* firmware state and the scratch area */
++	__be32 *scratch;	/* RPC arguments and results */
++	dma_addr_t scratch_dma;
++	bool ao_ready;
++	u32 ao_id;
++	int volume;
++};
++
++struct rtd_ao_stream {
++	struct rtd_ao *ao;
++	struct snd_pcm_substream *substream;
++
++	struct ao_shm *shm;
++	dma_addr_t shm_dma;
++	void *out;
++	dma_addr_t out_dma;
++
++	u32 pin;
++	u32 dec;
++	bool have_dec;
++
++	spinlock_t lock;	/* below, against the timer */
++	struct hrtimer timer;
++	ktime_t interval;
++	bool running;
++	bool eos;
++	u32 begin;		/* buffer physical address */
++	u32 buf_bytes;
++	u32 period_bytes;
++	u32 frame_bytes;
++	u32 wp;			/* bytes handed to the decoder */
++	u32 hw_pos;		/* bytes consumed by the decoder */
++	u32 period_acc;
++	snd_pcm_uframes_t committed;
++};
++
++static u32 ao_acpu(dma_addr_t addr)
++{
++	return RTD1295_ACPU_UNCACHED(addr);
++}
++
++static __be32 *ao_scratch(struct rtd_ao *ao)
++{
++	memset(ao->scratch, 0, AO_SCRATCH_SIZE);
++	return ao->scratch;
++}
++
++static int ao_call(struct rtd_ao *ao, const char *what, u32 cmd,
++		   unsigned int arg_word, unsigned int res_word,
++		   const __be32 *inner)
++{
++	u32 ret;
++	int err;
++
++	lockdep_assert_held(&ao->lock);
++
++	err = rtd1295_rpc_audio_call(ao->rpc, cmd,
++				     ao_acpu(ao->scratch_dma + arg_word * 4),
++				     ao_acpu(ao->scratch_dma + res_word * 4),
++				     &ret);
++	if (err) {
++		dev_err(ao->dev, "%s: RPC failed: %d\n", what, err);
++		return err;
++	}
++
++	if (ret != RTD1295_ACPU_S_OK ||
++	    (inner && be32_to_cpu(*inner) != RTD1295_ACPU_S_OK)) {
++		dev_err(ao->dev, "%s: firmware returned %#x/%#x\n", what, ret,
++			inner ? be32_to_cpu(*inner) : 0);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int ao_check_ready(struct rtd_ao *ao)
++{
++	__be32 *s = ao_scratch(ao);
++	int err;
++
++	/* info @0, RPCRES_LONG @4 */
++	err = ao_call(ao, "check ready", AO_CMD_CHECK_READY, 0, 1, NULL);
++	if (err)
++		return err;
++
++	return s[0] ? 0 : -EAGAIN;
++}
++
++/* AUDIO_RPC_INSTANCE @0, RPCRES_LONG @8 */
++static int ao_create(struct rtd_ao *ao, u32 type, u32 inst, bool check,
++		     u32 *id)
++{
++	__be32 *s = ao_scratch(ao);
++	int err;
++
++	s[0] = cpu_to_be32(inst);
++	s[1] = cpu_to_be32(type);
++	err = ao_call(ao, "create", AO_CMD_CREATE_AGENT, 0, 2,
++		      check ? &s[2] : NULL);
++	if (!err)
++		*id = be32_to_cpu(s[3]);
++	return err;
++}
++
++/* PRIVATEINFO_PARAMETERS @0 (18 words), PRIVATEINFO_RETURNVAL @72 */
++static int ao_privateinfo(struct rtd_ao *ao, const char *what, u32 type,
++			  int pin, u32 *out)
++{
++	__be32 *s = ao_scratch(ao);
++	int i, err;
++
++	s[0] = cpu_to_be32(ao->ao_id);
++	s[1] = cpu_to_be32(type);
++	/* The vendor stores a plain 0xff into each of these */
++	for (i = 0; i < 6; i++)
++		s[2 + i] = (__force __be32)0xff;
++	if (pin >= 0)
++		s[2] = cpu_to_be32(pin);
++
++	err = ao_call(ao, what, AO_CMD_PRIVATEINFO, 0, 18, NULL);
++	if (!err && out)
++		*out = be32_to_cpu(s[19]);
++	return err;
++}
++
++/* instance @0, result @4 (RUN: RPCRES_LONG, PAUSE: HRESULT) */
++static int ao_run(struct rtd_ao *ao, u32 inst)
++{
++	__be32 *s = ao_scratch(ao);
++
++	s[0] = cpu_to_be32(inst);
++	return ao_call(ao, "run", AO_CMD_RUN, 0, 1, &s[1]);
++}
++
++static int ao_pause(struct rtd_ao *ao, u32 inst)
++{
++	__be32 *s = ao_scratch(ao);
++
++	s[0] = cpu_to_be32(inst);
++	return ao_call(ao, "pause", AO_CMD_PAUSE, 0, 1, NULL);
++}
++
++/* RPCRES_LONG @0, HRESULT @8, instance @12 */
++static int ao_stop(struct rtd_ao *ao, u32 inst)
++{
++	__be32 *s = ao_scratch(ao);
++
++	s[3] = cpu_to_be32(inst);
++	return ao_call(ao, "stop", AO_CMD_STOP, 3, 0, &s[0]);
++}
++
++static int ao_destroy(struct rtd_ao *ao, u32 inst)
++{
++	__be32 *s = ao_scratch(ao);
++
++	s[3] = cpu_to_be32(inst);
++	return ao_call(ao, "destroy", AO_CMD_DESTROY, 3, 0, &s[0]);
++}
++
++/* RPCRES_LONG @0, HRESULT @8, AUDIO_RPC_SENDIO @12 */
++static int ao_flush(struct rtd_ao *ao, u32 inst, u32 pin)
++{
++	__be32 *s = ao_scratch(ao);
++
++	s[3] = cpu_to_be32(inst);
++	s[4] = cpu_to_be32(pin);
++	return ao_call(ao, "flush", AO_CMD_FLUSH, 3, 0, &s[0]);
++}
++
++/* RPCRES_LONG @0, HRESULT @8, AUDIO_RPC_RINGBUFFER_HEADER @12 */
++static int ao_init_ring(struct rtd_ao *ao, u32 inst, u32 pin, int read_idx,
++			const dma_addr_t *hdrs, unsigned int n)
++{
++	__be32 *s = ao_scratch(ao);
++	unsigned int i;
++
++	s[3] = cpu_to_be32(inst);
++	s[4] = cpu_to_be32(pin);
++	for (i = 0; i < n; i++)
++		s[5 + i] = cpu_to_be32(hdrs[i]);
++	s[13] = cpu_to_be32(read_idx);
++	s[14] = cpu_to_be32(n);
++	return ao_call(ao, "init ring", AO_CMD_INIT_RINGBUF, 3, 0, &s[0]);
++}
++
++/* AUDIO_RPC_CONNECTION @0, RPCRES_LONG @20 */
++static int ao_connect(struct rtd_ao *ao, u32 src, u32 src_pin, u32 dst,
++		      u32 dst_pin)
++{
++	__be32 *s = ao_scratch(ao);
++
++	s[0] = cpu_to_be32(src);
++	s[1] = cpu_to_be32(src_pin);
++	s[2] = cpu_to_be32(dst);
++	s[3] = cpu_to_be32(dst_pin);
++	return ao_call(ao, "connect", AO_CMD_CONNECT, 0, 5, &s[5]);
++}
++
++/* AUDIO_CONFIG_COMMAND @0, result @28 */
++static int ao_set_volume(struct rtd_ao *ao, int volume)
++{
++	__be32 *s = ao_scratch(ao);
++
++	s[0] = cpu_to_be32(AO_CONFIG_CMD_VOLUME);
++	s[1] = cpu_to_be32(AO_VOLUME_MAX - volume);
++	return ao_call(ao, "volume", AO_CMD_VOLUME_CONTROL, 0, 7, NULL);
++}
++
++static int ao_get_output(struct rtd_ao *ao)
++{
++	int i, err;
++
++	if (ao->ao_ready)
++		return 0;
++
++	for (i = 0; i < AO_READY_TRIES; i++) {
++		err = ao_check_ready(ao);
++		if (err != -EAGAIN)
++			break;
++		msleep(100);
++	}
++	if (err) {
++		dev_err(ao->dev, "audio firmware not ready: %d\n", err);
++		return err;
++	}
++
++	err = ao_create(ao, AO_TYPE_ALSA_OUT, 0, true, &ao->ao_id);
++	if (err)
++		return err;
++
++	ao->ao_ready = true;
++	dev_info(ao->dev, "firmware audio output instance %#x\n", ao->ao_id);
++	return 0;
++}
++
++static void ao_ring_hdr_init(struct ao_ring_hdr *h, dma_addr_t begin, u32 size)
++{
++	int i;
++
++	memset(h, 0, sizeof(*h));
++	h->begin = cpu_to_be32(begin);
++	h->size = cpu_to_be32(size);
++	h->buffer_id = cpu_to_be32(AO_RING_STREAM);
++	h->wp = h->begin;
++	for (i = 0; i < ARRAY_SIZE(h->rp); i++)
++		h->rp[i] = h->begin;
++	h->num_rp = cpu_to_be32(1);
++}
++
++/* Append to the in-band ring; the decoder parses it in order */
++static void ao_inband_write(struct rtd_ao_stream *st, const __be32 *w,
++			    unsigned int n)
++{
++	struct ao_ring_hdr *h = &st->shm->inband;
++	u32 begin = be32_to_cpu(h->begin);
++	u32 off = be32_to_cpu(READ_ONCE(h->wp)) - begin;
++	unsigned int i;
++
++	for (i = 0; i < n; i++) {
++		WRITE_ONCE(st->shm->inband_data[off / 4], w[i]);
++		off = (off + 4) % sizeof(st->shm->inband_data);
++	}
++	/* Command words before the pointer */
++	wmb();
++	WRITE_ONCE(h->wp, cpu_to_be32(begin + off));
++}
++
++static void ao_stream_teardown(struct rtd_ao_stream *st, bool stop_output)
++{
++	struct rtd_ao *ao = st->ao;
++	u32 out = ao->ao_id | st->pin;
++
++	lockdep_assert_held(&ao->lock);
++
++	if (st->have_dec)
++		ao_stop(ao, st->dec);
++	ao_pause(ao, out);
++	if (stop_output)
++		ao_stop(ao, out);
++	if (st->have_dec) {
++		ao_flush(ao, st->dec, AO_PIN_BASE_BS_IN);
++		/* Detach the AO input from the rings before they go away */
++		ao_init_ring(ao, ao->ao_id, st->pin, 0, NULL, 0);
++		ao_destroy(ao, st->dec);
++		st->have_dec = false;
++	}
++}
++
++static int ao_stream_setup(struct rtd_ao_stream *st,
++			   struct snd_pcm_runtime *runtime)
++{
++	struct rtd_ao *ao = st->ao;
++	struct ao_shm *shm = st->shm;
++	u32 out = ao->ao_id | st->pin;
++	dma_addr_t hdrs[AO_CHANNELS];
++	__be32 fmt[12];
++	int ch, err;
++
++	lockdep_assert_held(&ao->lock);
++
++	if (st->have_dec)
++		ao_stream_teardown(st, true);
++
++	err = ao_create(ao, AO_TYPE_DECODER, -1, false, &st->dec);
++	if (err)
++		return err;
++	st->have_dec = true;
++
++	/* Decoder output = AO input, one ring per channel */
++	for (ch = 0; ch < AO_CHANNELS; ch++) {
++		ao_ring_hdr_init(&shm->out[ch],
++				 st->out_dma + ch * AO_OUT_RING_SIZE,
++				 AO_OUT_RING_SIZE);
++		hdrs[ch] = st->shm_dma + offsetof(struct ao_shm, out[ch]);
++	}
++	err = ao_init_ring(ao, st->dec, AO_PIN_PCM_OUT, -1, hdrs, AO_CHANNELS);
++	if (err)
++		goto fail;
++	err = ao_init_ring(ao, ao->ao_id, st->pin, 0, hdrs, AO_CHANNELS);
++	if (err)
++		goto fail;
++	err = ao_connect(ao, st->dec, AO_PIN_PCM_OUT, ao->ao_id, st->pin);
++	if (err)
++		goto fail;
++
++	/* Decoder input = the ALSA buffer */
++	ao_ring_hdr_init(&shm->in, runtime->dma_addr, st->buf_bytes);
++	hdrs[0] = st->shm_dma + offsetof(struct ao_shm, in);
++	err = ao_init_ring(ao, st->dec, AO_PIN_BASE_BS_IN, 0, hdrs, 1);
++	if (err)
++		goto fail;
++
++	memset(shm->inband_data, 0, sizeof(shm->inband_data));
++	ao_ring_hdr_init(&shm->inband,
++			 st->shm_dma + offsetof(struct ao_shm, inband_data),
++			 sizeof(shm->inband_data));
++	hdrs[0] = st->shm_dma + offsetof(struct ao_shm, inband);
++	err = ao_init_ring(ao, st->dec, AO_PIN_INBAND_QUEUE, 0, hdrs, 1);
++	if (err)
++		goto fail;
++
++	/* snd_realtek_hw_init_decoder_info() */
++	err = ao_pause(ao, out);
++	if (!err)
++		err = ao_stop(ao, st->dec);
++	if (!err)
++		err = ao_flush(ao, st->dec, AO_PIN_BASE_BS_IN);
++	if (!err)
++		err = ao_run(ao, st->dec);
++	if (err)
++		goto fail;
++
++	memset(fmt, 0, sizeof(fmt));
++	fmt[0] = cpu_to_be32(AO_INBAND_NEW_FORMAT);
++	fmt[1] = cpu_to_be32(sizeof(fmt));
++	fmt[2] = shm->in.wp;
++	fmt[3] = cpu_to_be32(AO_DEC_LPCM);
++	fmt[4] = cpu_to_be32(runtime->channels);
++	fmt[5] = cpu_to_be32(runtime->sample_bits);
++	fmt[6] = cpu_to_be32(runtime->rate);
++	fmt[8] = cpu_to_be32(0x3 << 6);		/* channel mask: L, R */
++	fmt[11] = cpu_to_be32(AO_PCM_LITTLE_ENDIAN);
++	ao_inband_write(st, fmt, ARRAY_SIZE(fmt));
++
++	/* snd_realtek_hw_resume() */
++	err = ao_run(ao, st->dec);
++	if (!err)
++		err = ao_run(ao, out);
++	if (err)
++		goto fail;
++
++	return 0;
++
++fail:
++	ao_stream_teardown(st, true);
++	return err;
++}
++
++/* Wait until the AO has played what the decoder produced */
++static void ao_stream_drain(struct rtd_ao_stream *st)
++{
++	struct ao_ring_hdr *h = &st->shm->out[0];
++	unsigned long timeout = jiffies + msecs_to_jiffies(AO_DRAIN_TIMEOUT_MS);
++
++	while (READ_ONCE(h->rp[0]) != READ_ONCE(h->wp) &&
++	       time_before(jiffies, timeout))
++		usleep_range(5000, 10000);
++}
++
++static enum hrtimer_restart ao_timer(struct hrtimer *timer)
++{
++	struct rtd_ao_stream *st = container_of(timer, struct rtd_ao_stream,
++						timer);
++	struct snd_pcm_substream *substream = st->substream;
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	snd_pcm_uframes_t appl, frames;
++	bool elapsed = false, draining;
++	unsigned long flags;
++	u32 rp, used, room, n;
++
++	spin_lock_irqsave(&st->lock, flags);
++	if (!st->running) {
++		spin_unlock_irqrestore(&st->lock, flags);
++		return HRTIMER_NORESTART;
++	}
++
++	/*
++	 * Decoder progress. While draining, report every step: the end is
++	 * rarely on a period boundary.
++	 */
++	draining = READ_ONCE(runtime->state) == SNDRV_PCM_STATE_DRAINING;
++	rp = be32_to_cpu(READ_ONCE(st->shm->in.rp[0])) - st->begin;
++	if (rp < st->buf_bytes && rp != st->hw_pos) {
++		st->period_acc += (rp + st->buf_bytes - st->hw_pos) % st->buf_bytes;
++		st->hw_pos = rp;
++		if (st->period_acc >= st->period_bytes || draining) {
++			st->period_acc %= st->period_bytes;
++			elapsed = true;
++		}
++	}
++
++	/* Hand over what the application wrote; wp == rp means empty */
++	appl = READ_ONCE(runtime->control->appl_ptr);
++	frames = appl >= st->committed ? appl - st->committed :
++		 appl + runtime->boundary - st->committed;
++	used = (st->wp + st->buf_bytes - st->hw_pos) % st->buf_bytes;
++	room = used + st->frame_bytes < st->buf_bytes ?
++	       st->buf_bytes - used - st->frame_bytes : 0;
++	n = min_t(u64, frames_to_bytes(runtime, frames), room);
++	n -= n % st->frame_bytes;
++	if (n) {
++		st->wp = (st->wp + n) % st->buf_bytes;
++		st->committed += bytes_to_frames(runtime, n);
++		if (st->committed >= runtime->boundary)
++			st->committed -= runtime->boundary;
++		/* PCM data before the pointer */
++		wmb();
++		WRITE_ONCE(st->shm->in.wp, cpu_to_be32(st->begin + st->wp));
++	} else if (!frames && !st->eos && draining) {
++		/* Let the decoder flush its partial block */
++		__be32 eos[4] = {
++			cpu_to_be32(AO_INBAND_EOS),
++			cpu_to_be32(sizeof(eos)),
++			cpu_to_be32(st->begin + st->wp),
++			0,
++		};
++
++		ao_inband_write(st, eos, ARRAY_SIZE(eos));
++		st->eos = true;
++	}
++	spin_unlock_irqrestore(&st->lock, flags);
++
++	if (elapsed)
++		snd_pcm_period_elapsed(substream);
++
++	hrtimer_forward_now(timer, st->interval);
++	return HRTIMER_RESTART;
++}
++
++static const struct snd_pcm_hardware ao_pcm_hw = {
++	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
++		SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER |
++		SNDRV_PCM_INFO_BATCH | SNDRV_PCM_INFO_NO_REWINDS,
++	.formats = SNDRV_PCM_FMTBIT_S16_LE,
++	.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000,
++	.rate_min = 44100,
++	.rate_max = 48000,
++	.channels_min = AO_CHANNELS,
++	.channels_max = AO_CHANNELS,
++	.buffer_bytes_max = AO_BUFFER_MAX,
++	.period_bytes_min = 1024,
++	.period_bytes_max = SZ_16K,
++	.periods_min = 2,
++	.periods_max = 32,
++};
++
++static void ao_amp(struct rtd_ao *ao, bool on)
++{
++	if (!amp_always_on)
++		gpiod_set_value_cansleep(ao->amp, on);
++}
++
++static int ao_pcm_open(struct snd_pcm_substream *substream)
++{
++	struct rtd_ao *ao = snd_pcm_substream_chip(substream);
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct rtd_ao_stream *st;
++	u32 pin;
++	int err;
++
++	st = kzalloc(sizeof(*st), GFP_KERNEL);
++	if (!st)
++		return -ENOMEM;
++	st->ao = ao;
++	st->substream = substream;
++	spin_lock_init(&st->lock);
++	hrtimer_setup(&st->timer, ao_timer, CLOCK_MONOTONIC,
++		      HRTIMER_MODE_REL_SOFT);
++
++	st->shm = dma_alloc_coherent(ao->dev, sizeof(*st->shm), &st->shm_dma,
++				     GFP_KERNEL);
++	st->out = dma_alloc_coherent(ao->dev, AO_CHANNELS * AO_OUT_RING_SIZE,
++				     &st->out_dma, GFP_KERNEL);
++	if (!st->shm || !st->out) {
++		err = -ENOMEM;
++		goto free;
++	}
++	memset(st->out, 0, AO_CHANNELS * AO_OUT_RING_SIZE);
++
++	mutex_lock(&ao->lock);
++	err = ao_get_output(ao);
++	if (!err)
++		err = ao_privateinfo(ao, "get flash pin", AO_PRIV_GET_FLASH_PIN,
++				     -1, &pin);
++	if (!err && (pin < AO_PIN_FLASH_FIRST || pin > AO_PIN_FLASH_LAST)) {
++		dev_err(ao->dev, "no free AO input pin (%u)\n", pin);
++		err = -EBUSY;
++	}
++	if (!err) {
++		st->pin = pin;
++		ao_amp(ao, true);
++	}
++	mutex_unlock(&ao->lock);
++	if (err)
++		goto free;
++
++	runtime->hw = ao_pcm_hw;
++	runtime->private_data = st;
++	err = snd_pcm_hw_constraint_integer(runtime,
++					    SNDRV_PCM_HW_PARAM_PERIODS);
++	if (err < 0)
++		goto release;
++	err = snd_pcm_hw_constraint_step(runtime, 0,
++					 SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 64);
++	if (err < 0)
++		goto release;
++
++	return 0;
++
++release:
++	mutex_lock(&ao->lock);
++	ao_privateinfo(ao, "release flash pin", AO_PRIV_RELEASE_FLASH_PIN,
++		       st->pin, NULL);
++	ao_amp(ao, false);
++	mutex_unlock(&ao->lock);
++free:
++	if (st->out)
++		dma_free_coherent(ao->dev, AO_CHANNELS * AO_OUT_RING_SIZE,
++				  st->out, st->out_dma);
++	if (st->shm)
++		dma_free_coherent(ao->dev, sizeof(*st->shm), st->shm,
++				  st->shm_dma);
++	kfree(st);
++	return err;
++}
++
++static int ao_pcm_close(struct snd_pcm_substream *substream)
++{
++	struct rtd_ao_stream *st = substream->runtime->private_data;
++	struct rtd_ao *ao = st->ao;
++
++	hrtimer_cancel(&st->timer);
++	if (st->have_dec)
++		ao_stream_drain(st);
++
++	mutex_lock(&ao->lock);
++	ao_stream_teardown(st, false);
++	ao_privateinfo(ao, "release flash pin", AO_PRIV_RELEASE_FLASH_PIN,
++		       st->pin, NULL);
++	ao_amp(ao, false);
++	mutex_unlock(&ao->lock);
++
++	dma_free_coherent(ao->dev, AO_CHANNELS * AO_OUT_RING_SIZE, st->out,
++			  st->out_dma);
++	dma_free_coherent(ao->dev, sizeof(*st->shm), st->shm, st->shm_dma);
++	kfree(st);
++	return 0;
++}
++
++static int ao_pcm_prepare(struct snd_pcm_substream *substream)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct rtd_ao_stream *st = runtime->private_data;
++	struct rtd_ao *ao = st->ao;
++	u64 ns;
++	int err;
++
++	if (runtime->dma_addr + runtime->dma_bytes > RTD1295_ACPU_DMA_LIMIT) {
++		dev_err(ao->dev, "PCM buffer %pad is out of ACPU reach\n",
++			&runtime->dma_addr);
++		return -ENOMEM;
++	}
++
++	hrtimer_cancel(&st->timer);
++
++	st->begin = runtime->dma_addr;
++	st->buf_bytes = frames_to_bytes(runtime, runtime->buffer_size);
++	st->period_bytes = frames_to_bytes(runtime, runtime->period_size);
++	st->frame_bytes = frames_to_bytes(runtime, 1);
++	st->wp = 0;
++	st->hw_pos = 0;
++	st->period_acc = 0;
++	st->committed = runtime->control->appl_ptr;
++	st->eos = false;
++	st->running = false;
++
++	/* Poll at twice the period rate, at most every 2 ms */
++	ns = div_u64((u64)runtime->period_size * NSEC_PER_SEC,
++		     runtime->rate * 2);
++	st->interval = ns_to_ktime(max_t(u64, ns, 2 * NSEC_PER_MSEC));
++
++	mutex_lock(&ao->lock);
++	err = ao_stream_setup(st, runtime);
++	mutex_unlock(&ao->lock);
++
++	return err;
++}
++
++static int ao_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
++{
++	struct rtd_ao_stream *st = substream->runtime->private_data;
++	unsigned long flags;
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++		spin_lock_irqsave(&st->lock, flags);
++		st->running = true;
++		spin_unlock_irqrestore(&st->lock, flags);
++		hrtimer_start(&st->timer, 0, HRTIMER_MODE_REL_SOFT);
++		return 0;
++	case SNDRV_PCM_TRIGGER_STOP:
++		spin_lock_irqsave(&st->lock, flags);
++		st->running = false;
++		spin_unlock_irqrestore(&st->lock, flags);
++		hrtimer_try_to_cancel(&st->timer);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static snd_pcm_uframes_t ao_pcm_pointer(struct snd_pcm_substream *substream)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct rtd_ao_stream *st = runtime->private_data;
++	unsigned long flags;
++	u32 pos;
++
++	spin_lock_irqsave(&st->lock, flags);
++	pos = st->hw_pos;
++	spin_unlock_irqrestore(&st->lock, flags);
++
++	return bytes_to_frames(runtime, pos);
++}
++
++static const struct snd_pcm_ops ao_pcm_ops = {
++	.open = ao_pcm_open,
++	.close = ao_pcm_close,
++	.prepare = ao_pcm_prepare,
++	.trigger = ao_pcm_trigger,
++	.pointer = ao_pcm_pointer,
++};
++
++static int ao_volume_info(struct snd_kcontrol *kcontrol,
++			  struct snd_ctl_elem_info *uinfo)
++{
++	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
++	uinfo->count = 1;
++	uinfo->value.integer.min = 0;
++	uinfo->value.integer.max = AO_VOLUME_MAX;
++	return 0;
++}
++
++static int ao_volume_get(struct snd_kcontrol *kcontrol,
++			 struct snd_ctl_elem_value *ucontrol)
++{
++	struct rtd_ao *ao = snd_kcontrol_chip(kcontrol);
++
++	ucontrol->value.integer.value[0] = READ_ONCE(ao->volume);
++	return 0;
++}
++
++static int ao_volume_put(struct snd_kcontrol *kcontrol,
++			 struct snd_ctl_elem_value *ucontrol)
++{
++	struct rtd_ao *ao = snd_kcontrol_chip(kcontrol);
++	long vol = ucontrol->value.integer.value[0];
++	int err;
++
++	if (vol < 0 || vol > AO_VOLUME_MAX)
++		return -EINVAL;
++
++	mutex_lock(&ao->lock);
++	if (vol == ao->volume) {
++		mutex_unlock(&ao->lock);
++		return 0;
++	}
++	err = ao_set_volume(ao, vol);
++	if (!err)
++		WRITE_ONCE(ao->volume, vol);
++	mutex_unlock(&ao->lock);
++
++	return err ? err : 1;
++}
++
++static const struct snd_kcontrol_new ao_volume_ctl = {
++	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
++	.name = "Master Playback Volume",
++	.info = ao_volume_info,
++	.get = ao_volume_get,
++	.put = ao_volume_put,
++};
++
++static void ao_release_pool(void *dev)
++{
++	of_reserved_mem_device_release(dev);
++}
++
++static int rtd_ao_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct snd_card *card;
++	struct snd_pcm *pcm;
++	struct rtd_ao *ao;
++	int err;
++
++	ao = devm_kzalloc(dev, sizeof(*ao), GFP_KERNEL);
++	if (!ao)
++		return -ENOMEM;
++	ao->dev = dev;
++	ao->volume = AO_VOLUME_MAX;	/* the vendor default */
++	mutex_init(&ao->lock);
++
++	ao->rpc = rtd1295_rpc_get(dev);
++	if (IS_ERR(ao->rpc))
++		return dev_err_probe(dev, PTR_ERR(ao->rpc), "no ACPU RPC\n");
++
++	/* Non-cached pool below 512 MiB, see the DT memory-region */
++	err = of_reserved_mem_device_init(dev);
++	if (err)
++		return dev_err_probe(dev, err, "no memory-region\n");
++	err = devm_add_action_or_reset(dev, ao_release_pool, dev);
++	if (err)
++		return err;
++	err = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (err)
++		return err;
++
++	ao->amp = devm_gpiod_get_optional(dev, "enable",
++					  amp_always_on ? GPIOD_OUT_HIGH :
++							  GPIOD_OUT_LOW);
++	if (IS_ERR(ao->amp))
++		return dev_err_probe(dev, PTR_ERR(ao->amp),
++				     "cannot get the amplifier GPIO\n");
++
++	ao->scratch = dmam_alloc_coherent(dev, AO_SCRATCH_SIZE,
++					  &ao->scratch_dma, GFP_KERNEL);
++	if (!ao->scratch)
++		return -ENOMEM;
++	if (ao->scratch_dma + AO_SCRATCH_SIZE > RTD1295_ACPU_DMA_LIMIT)
++		return dev_err_probe(dev, -EINVAL,
++				     "memory-region is out of ACPU reach\n");
++
++	err = snd_devm_card_new(dev, SNDRV_DEFAULT_IDX1, "RTD1295",
++				THIS_MODULE, 0, &card);
++	if (err)
++		return err;
++	strscpy(card->driver, "rtd1295-ao");
++	strscpy(card->shortname, "RTD1295 ACPU");
++	strscpy(card->longname, "Realtek RTD1295 audio CPU output");
++
++	err = snd_pcm_new(card, "ACPU AO", 0, 1, 0, &pcm);
++	if (err)
++		return err;
++	pcm->private_data = ao;
++	strscpy(pcm->name, "ACPU AO");
++	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &ao_pcm_ops);
++	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, dev,
++				       AO_BUFFER_MAX, AO_BUFFER_MAX);
++
++	err = snd_ctl_add(card, snd_ctl_new1(&ao_volume_ctl, ao));
++	if (err)
++		return err;
++
++	err = snd_card_register(card);
++	if (err)
++		return err;
++
++	platform_set_drvdata(pdev, ao);
++	dev_info(dev, "ACPU playback registered (amplifier GPIO %s)\n",
++		 ao->amp ? "yes" : "none");
++	return 0;
++}
++
++static void rtd_ao_shutdown(struct platform_device *pdev)
++{
++	struct rtd_ao *ao = platform_get_drvdata(pdev);
++
++	/* No pop when the power goes */
++	if (ao)
++		gpiod_set_value_cansleep(ao->amp, 0);
++}
++
++static const struct of_device_id rtd_ao_of_match[] = {
++	{ .compatible = "realtek,rtd1295-acpu-audio" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, rtd_ao_of_match);
++
++static struct platform_driver rtd_ao_driver = {
++	.probe = rtd_ao_probe,
++	.shutdown = rtd_ao_shutdown,
++	.driver = {
++		.name = "rtd1295-ao",
++		.of_match_table = rtd_ao_of_match,
++	},
++};
++module_platform_driver(rtd_ao_driver);
++
++MODULE_DESCRIPTION("Realtek RTD1295 PCM playback through the audio CPU");
++MODULE_LICENSE("GPL");

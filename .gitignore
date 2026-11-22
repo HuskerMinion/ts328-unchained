@@ -1,0 +1,9 @@
+# build outputs
+/kernel/linux/
+/kernel/build/
+/kernel/out/
+/stage1/out/
+/debian/out/
+*.img
+*.img.gz
+*.bin

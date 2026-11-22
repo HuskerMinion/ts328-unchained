@@ -1,0 +1,110 @@
+From e69716fbe0e2ca03a48caac6241a2aa747af4c58 Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 07/40] arm64: smp: Add the Realtek RTD1295 spin-table variant
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The RTD129x boot loader (Realtek's U-Boot as shipped by QNAP and
+others) parks the secondary CPUs in a WFE loop on a 32-bit register in
+the SB2 block and jumps to the 32-bit address written there. Its
+firmware only implements PSCI v0.1 without CPU_ON, so this is the only
+way to bring the secondary CPUs up.
+
+The generic spin-table code maps the release address cacheable and
+does a 64-bit store followed by a cache clean. On this MMIO register
+that is not safe: the store also hits the neighboring register at +4,
+and a cacheable mapping of RBUS registers is not expected to work.
+
+Add a "realtek,rtd1295-spin-table" enable method that reuses the
+spin-table holding pen and only differs in how the entry point is
+published: a device mapping and a single 32-bit store, completed with
+dsb(st) before SEV so that a woken CPU reads the new value. This
+is what the vendor 4.2 kernel ("rtk-spin-table") and Andreas Färber's
+out-of-tree "HACK: arm64: smp: Tweak spin-table for RTD1295" do, without
+changing the generic spin-table for everyone else.
+
+The method is only built with ARCH_REALTEK. CPU hotplug is not
+supported, same as for spin-table.
+---
+ arch/arm64/kernel/cpu_ops.c        |  6 ++++
+ arch/arm64/kernel/smp_spin_table.c | 44 ++++++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/arch/arm64/kernel/cpu_ops.c b/arch/arm64/kernel/cpu_ops.c
+index e133011f6..995ebcc93 100644
+--- a/arch/arm64/kernel/cpu_ops.c
++++ b/arch/arm64/kernel/cpu_ops.c
+@@ -15,6 +15,9 @@
+ #include <asm/smp_plat.h>
+ 
+ extern const struct cpu_operations smp_spin_table_ops;
++#ifdef CONFIG_ARCH_REALTEK
++extern const struct cpu_operations rtd1295_spin_table_ops;
++#endif
+ #ifdef CONFIG_ARM64_ACPI_PARKING_PROTOCOL
+ extern const struct cpu_operations acpi_parking_protocol_ops;
+ #endif
+@@ -24,6 +27,9 @@ static const struct cpu_operations *cpu_ops[NR_CPUS] __ro_after_init;
+ 
+ static const struct cpu_operations *const dt_supported_cpu_ops[] __initconst = {
+ 	&smp_spin_table_ops,
++#ifdef CONFIG_ARCH_REALTEK
++	&rtd1295_spin_table_ops,
++#endif
+ 	&cpu_psci_ops,
+ 	NULL,
+ };
+diff --git a/arch/arm64/kernel/smp_spin_table.c b/arch/arm64/kernel/smp_spin_table.c
+index 49029eace..f26ca0c2d 100644
+--- a/arch/arm64/kernel/smp_spin_table.c
++++ b/arch/arm64/kernel/smp_spin_table.c
+@@ -125,3 +125,47 @@ const struct cpu_operations smp_spin_table_ops = {
+ 	.cpu_prepare	= smp_spin_table_cpu_prepare,
+ 	.cpu_boot	= smp_spin_table_cpu_boot,
+ };
++
++#ifdef CONFIG_ARCH_REALTEK
++/*
++ * The boot loader of Realtek RTD129x SoCs parks the secondary CPUs on a
++ * 32-bit MMIO register in the SB2 block instead of a 64-bit location in
++ * normal memory. Mapping it cacheable and writing it with a 64-bit store,
++ * as the generic spin-table code does, would also clobber the neighboring
++ * register. Write the entry point with a single 32-bit device store.
++ */
++static int rtd1295_spin_table_cpu_prepare(unsigned int cpu)
++{
++	phys_addr_t pa_holding_pen = __pa_symbol(secondary_holding_pen);
++	u32 __iomem *release_addr;
++
++	if (!cpu_release_addr[cpu])
++		return -ENODEV;
++
++	if (upper_32_bits(pa_holding_pen))
++		return -ERANGE;
++
++	release_addr = ioremap(cpu_release_addr[cpu], sizeof(*release_addr));
++	if (!release_addr)
++		return -ENOMEM;
++
++	/*
++	 * writel() only orders the store after earlier accesses. Complete
++	 * it with dsb(st) before the SEV, so a woken CPU reads the new value.
++	 */
++	writel(lower_32_bits(pa_holding_pen), release_addr);
++	dsb(st);
++	sev();
++
++	iounmap(release_addr);
++
++	return 0;
++}
++
++const struct cpu_operations rtd1295_spin_table_ops = {
++	.name		= "realtek,rtd1295-spin-table",
++	.cpu_init	= smp_spin_table_cpu_init,
++	.cpu_prepare	= rtd1295_spin_table_cpu_prepare,
++	.cpu_boot	= smp_spin_table_cpu_boot,
++};
++#endif

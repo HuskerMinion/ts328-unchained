@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# mdadm PROGRAM hook (mdadm.conf: PROGRAM /usr/local/sbin/md-event)
+# args: <event> <md device> [component]
+logger -t md-event "event=$1 device=$2 component=${3:-}"
+S=/usr/local/share/qnap-voice
+say() { aplay -q -D plughw:CARD=RTD1295,DEV=0 "$S/$1.wav" 2>/dev/null || true; }
+building() { grep -qE "resync|recovery|reshape" /proc/mdstat; }
+case "$1" in
+RebuildFinished|SpareActive)
+	building || { say raid-sync-complete; touch /run/md-sync-complete; } ;;
+Fail|FailSpare)
+	say raid-warning ;;
+DegradedArray)
+	# expected while a new array builds or a drive is being rebuilt
+	building || say raid-warning ;;
+esac

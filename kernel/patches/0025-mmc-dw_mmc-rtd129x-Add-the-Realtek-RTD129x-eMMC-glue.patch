@@ -1,0 +1,1911 @@
+From cf8778ea55e64760941d991b352de7f87f18ee9d Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 25/40] mmc: dw_mmc-rtd129x: Add the Realtek RTD129x eMMC glue
+
+The eMMC controller of the RTD1293/RTD1295/RTD1296 is a DesignWare MSHC
+(register file, FIFO at 0x200, 32-bit IDMAC) behind a Realtek wrapper
+above 0x400. The vendor driver (rtkemmc) reimplements the whole host on
+top of these registers; this glue uses dw_mmc instead and keeps only
+what the vendor driver does differently.
+
+Register access:
+- Every register access takes the RTD129x RBUS erratum lock, and every
+  write is preceded by an SB2 bus sync, like the vendor sync(). CMDARG
+  and CLKDIV are re-written until they read back, as in the vendor
+  code.
+- The register values follow the vendor driver: no IDMAC fixed bursts,
+  no CTRL.dma_enable (vendor CTRL 0x02000010), the vendor FIFOTH (MSIZE
+  1, RX watermark 1, TX watermark 127), and the 512-byte card read
+  threshold always enabled. dw_mmc disables the threshold below HS200,
+  so at 50 MHz a block read could start without room in the FIFO.
+- HCON reports a 64-bit host data width; if dw_mmc falls back to PIO,
+  32-bit FIFO accesses are used.
+
+IDMAC:
+This IDMAC does not write descriptors back, so the OWN bit of every
+descriptor it used stays set after a transfer. dw_mmc's
+dw_mci_prepare_desc32() polls OWN for up to 100 ms before it reuses a
+descriptor, then re-initializes the ring and moves the transfer by PIO.
+The vendor driver never reads its descriptors back and rewrites them
+for every transfer (make_sg_des()). Do the same: replace dw_mmc's IDMAC
+start with one that builds the chain from scratch for every request
+(32-bit chained descriptors of at most 4 KiB) and never polls OWN, and
+clear OWN on the used chain when the transfer has completed, and before
+a data request while the host is idle, which also covers the error and
+stop paths.
+
+The chain is started with the vendor sequence: CH and DIC also on the
+last descriptor, IDMAC interrupts off, DBADDR rewritten before each
+start, no per-request DMA reset and no poll demand (the data command
+starts the IDMAC). dw_mmc's own start sequence works for single
+descriptor requests, but froze the SoC as soon as a request spanned
+several descriptors.
+
+Completion and recovery:
+- Without IDMAC interrupts, a data request completes as in the vendor
+  driver: after DATA_OVER, once the wrapper DMA_DONE flag is set (reads)
+  and TBBCNT has reached BYTCNT. A work item checks this every 4 ms
+  while a data request is in flight. The dma_complete hook then waits
+  briefly for DMA_DONE after a read and clears it for the next transfer.
+  DMA_DONE is also cleared before each IDMAC start, since the error and
+  stop paths can leave it set, so it always belongs to the current
+  transfer.
+- The same work item looks at MINTSTS and IDSTS and runs the dw_mmc
+  interrupt handler through dw_mci_handle_pending_irq() if status is
+  pending that was never delivered, as the vendor driver polls.
+- dw_mmc has no timeout for a data transfer whose DATA_OVER arrived but
+  whose DMA did not finish, and a hang there held the boot forever in
+  the partition scan. When the DMA is still not done 2 s after the
+  request started (and at least 100 ms after DATA_OVER), the work item
+  dumps the registers, stops the DMA and fails the data with
+  -ETIMEDOUT.
+- A request that sees no DATA_OVER at all is failed the same way, like
+  dw_mmc's own data timeout timer, but only after a limit derived from
+  the card's data timeout times the block count plus 2 s, at least 2 s
+  and at most the 60 s block request timeout, so that large writes to a
+  slow but in-spec card are not cut short.
+The controller interrupt is disabled while the work item looks at the
+state, so a request is never completed twice. The tracked request is
+dropped once it has finished, so a later request that reuses its memory
+is never mistaken for it, and at remove, after the host is gone, before
+the work item is canceled.
+
+Clocks and pads:
+- At probe the eMMC PLL is set to 100 MHz (N code 0x57) with sample and
+  drive phase 0, and the wrapper clock generator is programmed as in
+  the vendor SDR fallback. With dw_mmc's divider that gives 400 kHz for
+  identification and 50 MHz high-speed SDR. HS200, HS400 and DDR52 are
+  not supported yet, so the HS200/HS400 state that U-Boot leaves behind
+  is cleared. Chips before revision A01 are not supported.
+- The pad drive is the vendor init value 0x33 up to 26 MHz and the
+  realtek,drive-hs codes (default: the vendor SDR50 pddrive_nf_s0
+  values) above. EMMC_PAD_CTL is left as U-Boot set it, the 1.8 V
+  signaling bit is set, and there is no voltage switch.
+- The pads are left as U-Boot muxed them; there is no pinctrl driver.
+
+Write protection:
+For bring-up on boards that boot from the eMMC, "realtek,read-only"
+makes the driver hide the write, erase, write-protect and lock command
+classes in the CSD, so that the MMC block driver marks every area
+read-only, and refuse write, erase and write-protect commands and
+EXT_CSD writes outside a short list needed for card init and partition
+switching (which may never change the boot configuration). The register
+accessors also refuse to start a data write or an erase command as a
+last line of defense.
+
+The read-only module parameter allow_writes=1 lifts all of this. With
+writes enabled, data writes and erases pass in the user area only, and
+write_min_lba refuses them below a block address, so that a test can
+protect the partitions in front of it. Still refused are EXT_CSD
+writes outside the list, CMD26/27 (program CID/CSD), CMD28/29 (write
+protect), CMD42 (lock), the vendor commands CMD60-63, and every
+CMD24/CMD25 data write and erase while a boot or general purpose
+partition is selected. With the RPMB partition selected, writes and
+erases are always refused, which covers the irreversible RPMB key
+programming and makes RPMB unusable on these boards.
+
+boot1_writes allows plain CMD24/CMD25 data writes while the boot1
+hardware partition is selected, in read-only and in write mode, for
+write tests through MMC_IOC_CMD. In read-only mode the user area and
+boot0 stay refused, and the CSD patch keeps every block device
+read-only.
+
+CMD5 (sleep) and CMD15 (go inactive) are always refused: these boards
+cannot power-cycle the eMMC, and the boot loader must find the card
+awake after a warm reboot.
+
+A sysfs file, rtd129x_status, reports the read-only state and counters
+of the completion and recovery paths.
+---
+ drivers/mmc/host/Kconfig          |   29 +
+ drivers/mmc/host/Makefile         |    1 +
+ drivers/mmc/host/dw_mmc-rtd129x.c | 1720 +++++++++++++++++++++++++++++
+ 3 files changed, 1750 insertions(+)
+ create mode 100644 drivers/mmc/host/dw_mmc-rtd129x.c
+
+diff --git a/drivers/mmc/host/Kconfig b/drivers/mmc/host/Kconfig
+index c94ae4794..b9f0d83af 100644
+--- a/drivers/mmc/host/Kconfig
++++ b/drivers/mmc/host/Kconfig
+@@ -794,6 +794,14 @@ config MMC_DW
+ 	  block, this provides host support for SD and MMC interfaces, in both
+ 	  PIO, internal DMA mode and external DMA mode.
+ 
++config MMC_DW_REG_OPS
++	bool
++	depends on MMC_DW
++	help
++	  Let a platform glue driver override the register accessors of the
++	  Synopsys DesignWare Memory Card Interface driver. Selected by the
++	  glue drivers that need it.
++
+ config MMC_DW_PLTFM
+ 	tristate "Synopsys Designware MCI Support as platform device"
+ 	depends on MMC_DW
+@@ -874,6 +882,27 @@ config MMC_DW_ROCKCHIP
+ 	  Synopsys DesignWare Memory Card Interface driver. Select this option
+ 	  for platforms based on RK3066, RK3188 and RK3288 SoC's.
+ 
++config MMC_DW_RTD129X
++	tristate "Realtek RTD129x specific extensions for Synopsys DW Memory Card Interface"
++	depends on MMC_DW
++	depends on ARCH_REALTEK || COMPILE_TEST
++	depends on OF
++	select MMC_DW_PLTFM
++	select MMC_DW_REG_OPS
++	select MFD_SYSCON
++	select RTD129X_RBUS_LOCK
++	help
++	  This selects support for the eMMC controller of the Realtek
++	  RTD1293, RTD1295 and RTD1296 SoCs, a Synopsys DesignWare MSHC
++	  behind a Realtek wrapper. The glue serializes register accesses
++	  with the RTD129x RBUS erratum lock and programs the eMMC PLL for
++	  a fixed 50 MHz high-speed bus.
++
++	  If the device tree sets "realtek,read-only", the card is reported
++	  as write-protected and all write, erase and write-protect commands
++	  are refused unless the kernel is booted with
++	  dw_mmc_rtd129x.allow_writes=1.
++
+ config MMC_DW_STARFIVE
+ 	tristate "StarFive specific extensions for Synopsys DW Memory Card Interface"
+ 	depends on SOC_STARFIVE
+diff --git a/drivers/mmc/host/Makefile b/drivers/mmc/host/Makefile
+index 5057fea8a..04a31e803 100644
+--- a/drivers/mmc/host/Makefile
++++ b/drivers/mmc/host/Makefile
+@@ -56,6 +56,7 @@ obj-$(CONFIG_MMC_DW_HI3798MV200) += dw_mmc-hi3798mv200.o
+ obj-$(CONFIG_MMC_DW_K3)		+= dw_mmc-k3.o
+ obj-$(CONFIG_MMC_DW_PCI)	+= dw_mmc-pci.o
+ obj-$(CONFIG_MMC_DW_ROCKCHIP)	+= dw_mmc-rockchip.o
++obj-$(CONFIG_MMC_DW_RTD129X)	+= dw_mmc-rtd129x.o
+ obj-$(CONFIG_MMC_DW_STARFIVE)	+= dw_mmc-starfive.o
+ obj-$(CONFIG_MMC_SH_MMCIF)	+= sh_mmcif.o
+ obj-$(CONFIG_MMC_JZ4740)	+= jz4740_mmc.o
+diff --git a/drivers/mmc/host/dw_mmc-rtd129x.c b/drivers/mmc/host/dw_mmc-rtd129x.c
+new file mode 100644
+index 000000000..4f63a9adb
+--- /dev/null
++++ b/drivers/mmc/host/dw_mmc-rtd129x.c
+@@ -0,0 +1,1720 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Realtek RTD129x (RTD1293/RTD1295/RTD1296) eMMC host controller glue
++ *
++ * The eMMC controller at 0x98012000 is a Synopsys DesignWare MSHC: the
++ * standard register file at 0x000-0x1ff, the data FIFO at 0x200 and an
++ * IDMAC with 32-bit chained descriptors. A Realtek wrapper above 0x400
++ * routes the interrupt and holds the clock generator, the pad mux and the
++ * pad drive registers. The eMMC PLL lives in the CRT block.
++ *
++ * Based on the Realtek vendor driver (QNAP 4.2.8 rtkemmc.c), which is
++ * Copyright (C) 2015 Realtek Ltd.
++ *
++ * Register accesses are serialized with the RTD129x RBUS erratum lock, as
++ * in the Realtek vendor driver ("rtkemmc"), and each register write is
++ * preceded by an SB2 bus sync like the vendor sync(). The PLL is set to
++ * 100 MHz once, so the card runs at 400 kHz for identification and at
++ * 50 MHz in high-speed SDR mode. HS200/HS400 and DDR modes are not
++ * supported yet.
++ *
++ * For bring-up, "realtek,read-only" in the device tree makes the host
++ * report the card as write-protected and refuse write, erase and
++ * write-protect commands. Booting with dw_mmc_rtd129x.allow_writes=1
++ * lifts that.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/iopoll.h>
++#include <linux/mfd/syscon.h>
++#include <linux/mmc/card.h>
++#include <linux/mmc/host.h>
++#include <linux/mmc/mmc.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/sizes.h>
++#include <linux/soc/realtek/rtd129x-lock.h>
++#include <linux/workqueue.h>
++
++#include "dw_mmc.h"
++#include "dw_mmc-pltfm.h"
++
++/* Realtek wrapper registers, offsets from the controller base */
++#define RTD_EMMC_DDR_REG		0x10c	/* HS400 enable, bit 31 */
++#define RTD_EMMC_CP			0x41c
++#define RTD_EMMC_ISR			0x424
++#define  RTD_EMMC_ISR_WRITE_DATA	BIT(0)	/* 1: set, 0: clear the bits */
++#define  RTD_EMMC_ISR_DMA_DONE		BIT(1)
++#define  RTD_EMMC_ISR_DMA_INT_MASK	BIT(2)
++#define  RTD_EMMC_ISR_DESC_INT_MASK	BIT(3)
++#define  RTD_EMMC_ISR_IP_INT_MASK	BIT(4)
++#define RTD_EMMC_DUMMY_SYS		0x42c
++#define  RTD_EMMC_DUMMY_SYS_PLL_UPDATE	BIT(30)	/* toggle after N/F change */
++#define RTD_EMMC_PAD_CTL		0x474	/* 0: 1.8 V pads */
++#define RTD_EMMC_CKGEN_CTL		0x478
++#define  RTD_EMMC_CKGEN_DEFAULT		0x2100	/* PLL source, wrapper div 1 */
++#define  RTD_EMMC_CKGEN_SRC_4MHZ	GENMASK(18, 16)
++#define RTD_EMMC_DQS_CTRL1		0x498
++#define RTD_EMMC_SWC_SEL		0x4d4
++#define RTD_EMMC_MUXPAD0		0x600
++#define  RTD_EMMC_MUXPAD0_EMMC_MASK	0xffff0c00
++#define  RTD_EMMC_MUXPAD0_EMMC		0xaaaa0800
++#define RTD_EMMC_PFUNC_NF1		0x60c
++#define RTD_EMMC_PDRIVE_NF1		0x624	/* D0-D3 */
++#define RTD_EMMC_PDRIVE_NF2		0x628	/* D4-D7 */
++#define RTD_EMMC_PDRIVE_NF3		0x62c	/* CLK [15:8], CMD [31:24] */
++#define RTD_EMMC_PDRIVE_NF4		0x630	/* data strobe */
++#define  RTD_EMMC_PDRIVE_INIT		0x33	/* vendor value for init */
++
++/* CRT registers */
++#define RTD_CRT_SOFT_RESET2		0x004
++#define  RTD_CRT_RSTN_EMMC		BIT(11)
++#define RTD_CRT_CLOCK_ENABLE1		0x00c
++#define  RTD_CRT_CLK_EN_EMMC		BIT(24)
++#define  RTD_CRT_CLK_EN_EMMC_IP		BIT(28)
++#define RTD_CRT_PLL_EMMC1		0x1f0
++#define  RTD_PLL_EMMC1_RSTB		BIT(1)
++#define  RTD_PLL_EMMC1_PHASE0		GENMASK(7, 3)
++#define  RTD_PLL_EMMC1_PHASE1		GENMASK(12, 8)
++#define RTD_CRT_PLL_EMMC3		0x1f8
++#define  RTD_PLL_EMMC3_N		GENMASK(31, 16)
++#define RTD_CRT_PLL_EMMC4		0x1fc
++#define  RTD_PLL_EMMC4_ON		BIT(0)	/* cleared while N changes */
++#define  RTD_PLL_EMMC4_KEEP		GENMASK(2, 1)
++
++/* SB2 registers */
++#define RTD_SB2_SYNC			0x020
++#define RTD_SB2_CHIP_REV		0x204
++#define  RTD129X_REV_A01		0x00010000
++
++/*
++ * PLL N code 0x57 is what the vendor drivers program for "100 MHz"; with
++ * CLKDIV 1 (divide by 2) that gives the 50 MHz high-speed clock of the
++ * vendor fallback mode.
++ */
++#define RTD_EMMC_PLL_N_100MHZ		0x57
++#define RTD_EMMC_BUS_HZ			100000000
++
++/* CSD CCC bits 95:84 arrive in RESP2 bits 31:20; classes 4 to 7 are writes */
++#define RTD_CSD_CCC_WRITE_MASK		GENMASK(27, 24)
++
++#define RTD_FIFOTH_MSIZE		GENMASK(30, 28)
++
++#define RTD_MMC_SEND_WRITE_PROT_TYPE	31	/* CMD31, read-type */
++
++/* Vendor FIFOTH: MSIZE 1, RX watermark 1, TX watermark 127 */
++#define RTD_EMMC_FIFOTH			SDMMC_SET_FIFOTH(0, 1, 127)
++
++/* Vendor CARD_THR_CTL: card read threshold 512 bytes, always enabled */
++#define RTD_EMMC_CDTHRCTL		SDMMC_SET_THLD(512, SDMMC_CARD_RD_THR_EN)
++
++/*
++ * Data request watchdog: poll period; time after which a request whose DTO
++ * came but whose DMA never completed fails; floor and ceiling of the
++ * limit for a request that sees no DTO at all (otherwise derived from the
++ * card's data timeout); and the time after which the vendor DMA_DONE
++ * criterion is trusted without the vendor completion quirks.
++ */
++#define RTD_WD_POLL_MS			4	/* one jiffy at HZ=250 */
++#define RTD_WD_TIMEOUT_MS		2000
++#define RTD_WD_NO_DTO_MAX_MS		60000	/* the mmc block request timeout */
++#define RTD_WD_DMA_DONE_MS		100
++
++enum { RTD_DRV_CLK, RTD_DRV_CMD, RTD_DRV_DATA, RTD_DRV_DS, RTD_DRV_NUM };
++
++/*
++ * Fixed driver behavior, validated on the hardware:
++ * - rbus_lock: take the shared RBUS erratum lock around register accesses
++ * - bus_sync: SB2 bus sync before each register write, as the vendor
++ * - max_req_kb: 0, no request size limit beyond dw_mmc's; multi-descriptor
++ *   requests are safe with the vendor IDMAC start sequence below
++ * - vendor_fifoth: always program the vendor FIFOTH value
++ * - cmd23: use CMD23 for multi-block transfers
++ * - pio: no, always use the IDMAC
++ * - kick: poll the status registers during data requests and run the
++ *   interrupt handler for interrupts that were not delivered
++ * - watchdog: per-request watchdog with lost-completion recovery
++ * - trace: no request tracing
++ * - own_fix: clear the descriptor OWN bits after a transfer, since this
++ *   IDMAC does not write them back
++ */
++static const bool rbus_lock = true;
++static const bool bus_sync = true;
++static const unsigned int max_req_kb;
++static const bool vendor_fifoth = true;
++static const bool cmd23 = true;
++static const bool pio;
++static const bool kick = true;
++static const bool watchdog = true;
++static const unsigned int trace;
++static const bool own_fix = true;
++
++/*
++ * IDMAC start sequence: the vendor-like variant (all bits set) is required
++ * for requests that span several descriptors; dw_mmc's own sequence (0)
++ * freezes the SoC in that case.
++ */
++#define RTD_DQ_LAST_CH		BIT(0)	/* keep CH (next pointer) on the last descriptor */
++#define RTD_DQ_LAST_DIC		BIT(1)	/* DIC on the last descriptor too: no RI, complete on DTO + DMA_DONE + TBBCNT */
++#define RTD_DQ_NO_DMA_EN	BIT(2)	/* never set CTRL.dma_enable (bit 5), vendor CTRL 0x02000010 */
++#define RTD_DQ_NO_RESET		BIT(3)	/* no DMA_RESET/SWR before each start */
++#define RTD_DQ_DBADDR		BIT(4)	/* rewrite DBADDR before each start */
++#define RTD_DQ_NO_PLDMND	BIT(5)	/* no poll demand write; the data command starts the IDMAC */
++#define RTD_DQ_IDINTEN0		BIT(6)	/* IDINTEN = 0 as the vendor; completion as LAST_DIC */
++#define RTD_DQ_VENDOR		0x7f
++
++static const unsigned int dma_quirks = RTD_DQ_VENDOR;
++
++static unsigned int write_min_lba;
++module_param(write_min_lba, uint, 0644);
++MODULE_PARM_DESC(write_min_lba,
++		 "With writes enabled: refuse user-area writes and erases below this block address (e.g. 1009664, the start of p7 on the TS-328)");
++
++static bool boot1_writes;
++module_param(boot1_writes, bool, 0644);
++MODULE_PARM_DESC(boot1_writes,
++		 "Allow CMD24/CMD25 data writes while the boot1 partition is selected, in read-only and in write mode (test only; use MMC_IOC_CMD)");
++
++static bool allow_writes;
++module_param(allow_writes, bool, 0444);
++MODULE_PARM_DESC(allow_writes,
++		 "Allow eMMC writes although the device tree sets realtek,read-only");
++
++struct dw_mci_rtd129x {
++	struct dw_mci *host;
++	struct regmap *crt;
++	void __iomem *sb2;
++	bool read_only;
++	/* state of the last command, protected by the RBUS lock */
++	bool csd_pending;
++	bool csd_patched;
++	unsigned int rewrites;
++	unsigned int dma_done_timeouts;
++	unsigned int polled_completions;
++	unsigned int watchdog_timeouts;
++	/* interrupt sources seen by the handler (hardirq) */
++	unsigned int irq_entries;
++	unsigned int irq_cmd_done;
++	unsigned int irq_data_over;
++	unsigned int irq_errors;
++	unsigned int irq_idmac_ri;
++	unsigned int irq_idmac_ti;
++	unsigned int irq_idmac_ais;
++	/* status reads outside hardirq: dw_mmc's CTO/DTO timers */
++	unsigned int timer_status_reads;
++	/* handler runs from the watchdog for undelivered interrupts */
++	unsigned int kicks;
++	/* STATUS reads showing DAT0 busy (dw_mmc polls every 10 us) */
++	unsigned int busy_reads;
++	/* descriptors the IDMAC left owned after it finished */
++	unsigned int own_left;
++	unsigned int own_fixups;
++	/* IDMAC-mode requests that dw_mmc moved by PIO (RXDR/TXDR seen) */
++	unsigned int pio_fallbacks;
++	/* glue-built IDMAC chains */
++	unsigned int dma_starts;
++	unsigned int dma_descs;
++	unsigned int dma_desc_max;
++	unsigned int dma_start_errs;
++	unsigned int vendor_completions;
++	unsigned int boot1_writes_done;
++	unsigned int last_quirks;
++	unsigned int cur_quirks;	/* dma_quirks of the request in flight */
++	unsigned int dump_count;
++	struct dw_mci_dma_ops dma_ops;
++	/* data requests */
++	unsigned int data_reqs;
++	unsigned int data_retries;
++	unsigned int data_err_timeout;
++	unsigned int data_err_crc;
++	unsigned int data_err_other;
++	unsigned int cmd_errs;
++	u64 lat_sum_us;
++	u32 lat_max_us;
++	u32 err_bits;		/* OR of all error bits seen */
++	/* current data request, for tracing */
++	struct mmc_request *tr_mrq;
++	void (*tr_done)(struct mmc_request *mrq);
++	u64 tr_t0;
++	u32 tr_cmd_us, tr_dto_us, tr_ri_us;
++	u32 tr_mintsts;
++	u32 tr_busy_reads;
++	bool tr_kicked, tr_polled;
++	unsigned int tr_count;
++	bool in_wd;		/* watchdog's own status reads: not counted */
++	bool kicking;		/* handler run from the watchdog */
++	/* pad drive for init and for clocks above 26 MHz (clk, cmd, data, ds) */
++	u32 drive_hs[RTD_DRV_NUM];
++	bool drive_is_hs;
++	/* data request watchdog */
++	struct delayed_work wd_work;
++	struct mmc_request *wd_mrq;
++	unsigned long wd_start;
++	unsigned long wd_no_dto_limit;	/* jiffies, from wd_start */
++	unsigned long wd_dto_at;	/* first poll that saw the DTO */
++	bool wd_dto_seen;
++	void (*request)(struct mmc_host *mmc, struct mmc_request *mrq);
++	struct mmc_host_ops ops;
++};
++
++/*
++ * Register accessors
++ *
++ * The vendor driver takes the global RBUS lock around every eMMC register
++ * access in its command, interrupt and polling paths and releases it while
++ * the transfer runs. Taking it around each access gives the same guarantee:
++ * no eMMC register access overlaps an access at offsets 0x800-0x9ff of
++ * another RBUS block.
++ */
++static unsigned long rtd_lock(void)
++{
++	unsigned long flags;
++
++	if (rbus_lock)
++		return rtd129x_rbus_lock();
++
++	local_irq_save(flags);
++	return flags;
++}
++
++static void rtd_unlock(unsigned long flags)
++{
++	if (rbus_lock)
++		rtd129x_rbus_unlock(flags);
++	else
++		local_irq_restore(flags);
++}
++
++static void rtd_bus_sync(struct dw_mci_rtd129x *priv)
++{
++	if (!bus_sync)
++		return;
++
++	mb();
++	writel_relaxed(0, priv->sb2 + RTD_SB2_SYNC);
++	mb();
++}
++
++static u32 rtd_wrapper_readl(struct dw_mci_rtd129x *priv, u32 reg)
++{
++	unsigned long flags;
++	u32 val;
++
++	flags = rtd_lock();
++	val = readl_relaxed(priv->host->regs + reg);
++	rtd_unlock(flags);
++
++	return val;
++}
++
++static void rtd_wrapper_writel(struct dw_mci_rtd129x *priv, u32 reg, u32 val)
++{
++	unsigned long flags;
++
++	flags = rtd_lock();
++	rtd_bus_sync(priv);
++	writel_relaxed(val, priv->host->regs + reg);
++	rtd_unlock(flags);
++}
++
++static u32 rtd_us_since(u64 t0)
++{
++	return div_u64(ktime_get_ns() - t0, NSEC_PER_USEC);
++}
++
++/* Called with the RBUS lock (and local IRQs off) held */
++static void rtd_note_status(struct dw_mci_rtd129x *priv, u32 reg, u32 val)
++{
++	bool irq = in_hardirq() || READ_ONCE(priv->kicking);
++
++	if (READ_ONCE(priv->in_wd))
++		return;
++	if (!irq) {
++		/* dw_mmc's CTO/DTO timers and our kick path read MINTSTS */
++		if (reg == SDMMC_MINTSTS)
++			priv->timer_status_reads++;
++		return;
++	}
++
++	if (reg == SDMMC_MINTSTS) {
++		priv->irq_entries++;
++		if (val & SDMMC_INT_CMD_DONE)
++			priv->irq_cmd_done++;
++		if (val & SDMMC_INT_DATA_OVER)
++			priv->irq_data_over++;
++		if (val & SDMMC_INT_ERROR) {
++			priv->irq_errors++;
++			priv->err_bits |= val & SDMMC_INT_ERROR;
++		}
++		if (priv->tr_mrq) {
++			priv->tr_mintsts |= val;
++			if ((val & SDMMC_INT_CMD_DONE) && !priv->tr_cmd_us)
++				priv->tr_cmd_us = rtd_us_since(priv->tr_t0) ?: 1;
++			if ((val & SDMMC_INT_DATA_OVER) && !priv->tr_dto_us)
++				priv->tr_dto_us = rtd_us_since(priv->tr_t0) ?: 1;
++		}
++	} else {
++		if (val & SDMMC_IDMAC_INT_RI)
++			priv->irq_idmac_ri++;
++		if (val & SDMMC_IDMAC_INT_TI)
++			priv->irq_idmac_ti++;
++		if (val & SDMMC_IDMAC_INT_AI)
++			priv->irq_idmac_ais++;
++		if (priv->tr_mrq && (val & (SDMMC_IDMAC_INT_RI | SDMMC_IDMAC_INT_TI)) &&
++		    !priv->tr_ri_us)
++			priv->tr_ri_us = rtd_us_since(priv->tr_t0) ?: 1;
++	}
++}
++
++static u32 dw_mci_rtd129x_readl(struct dw_mci *host, u32 reg)
++{
++	struct dw_mci_rtd129x *priv = host->priv;
++	bool patched = false;
++	unsigned long flags;
++	u32 val;
++
++	flags = rtd_lock();
++	val = readl_relaxed(host->regs + reg);
++	if (reg == SDMMC_MINTSTS || reg == SDMMC_IDSTS)
++		rtd_note_status(priv, reg, val);
++	if (reg == SDMMC_STATUS && (val & SDMMC_STATUS_BUSY) &&
++	    !READ_ONCE(priv->in_wd)) {
++		priv->busy_reads++;
++		if (priv->tr_mrq)
++			priv->tr_busy_reads++;
++	}
++	if (reg == SDMMC_RESP2 && priv->csd_pending) {
++		/* Hide the write, erase, write-protect and lock classes */
++		val &= ~RTD_CSD_CCC_WRITE_MASK;
++		priv->csd_pending = false;
++		patched = !priv->csd_patched;
++		priv->csd_patched = true;
++	}
++	rtd_unlock(flags);
++
++	if (patched)
++		dev_info(host->dev,
++			 "read-only: write command classes removed from the CSD\n");
++
++	return val;
++}
++
++/* boot1_writes test mode: is the boot1 hardware partition selected? */
++static bool rtd_boot1_selected(struct dw_mci *host)
++{
++	struct mmc_card *card;
++
++	if (!READ_ONCE(boot1_writes) || !host->slot)
++		return false;
++	card = READ_ONCE(host->slot->mmc->card);
++
++	return card && (card->ext_csd.part_config &
++			EXT_CSD_PART_CONFIG_ACC_MASK) ==
++		       EXT_CSD_PART_CONFIG_ACC_BOOT0 + 1;
++}
++
++/* Last line of defense: never start a data write or an erase */
++static bool rtd_cmdr_is_write(u32 cmdr)
++{
++	if (!(cmdr & SDMMC_CMD_START) || (cmdr & SDMMC_CMD_UPD_CLK))
++		return false;
++
++	if ((cmdr & SDMMC_CMD_DAT_EXP) && (cmdr & SDMMC_CMD_DAT_WR))
++		return true;
++
++	switch (cmdr & 0x3f) {
++	case MMC_ERASE_GROUP_START:
++	case MMC_ERASE_GROUP_END:
++	case MMC_ERASE:
++	case MMC_SET_WRITE_PROT:
++	case MMC_CLR_WRITE_PROT:
++		return true;
++	}
++
++	return false;
++}
++
++static void dw_mci_rtd129x_writel(struct dw_mci *host, u32 reg, u32 val)
++{
++	struct dw_mci_rtd129x *priv = host->priv;
++	unsigned long flags;
++	unsigned int i = 0;
++
++	switch (reg) {
++	case SDMMC_CMD:
++		if (priv->read_only && rtd_cmdr_is_write(val) &&
++		    !((val & SDMMC_CMD_DAT_WR) &&
++		      ((val & 0x3f) == MMC_WRITE_BLOCK ||
++		       (val & 0x3f) == MMC_WRITE_MULTIPLE_BLOCK) &&
++		      rtd_boot1_selected(host))) {
++			dev_err_ratelimited(host->dev,
++					    "read-only: refusing to start command %#x\n",
++					    val);
++			return;
++		}
++		break;
++	case SDMMC_BMOD:
++		/* The vendor drivers never use fixed bursts */
++		val &= ~SDMMC_IDMAC_FB;
++		break;
++	case SDMMC_CTRL:
++		/* Vendor CTRL is 0x02000010: no dma_enable (bit 5) */
++		if (READ_ONCE(dma_quirks) & RTD_DQ_NO_DMA_EN)
++			val &= ~SDMMC_CTRL_DMA_ENABLE;
++		break;
++	case SDMMC_FIFOTH:
++		/* ... and always use single transfers (MSIZE 1) */
++		if (vendor_fifoth)
++			val = RTD_EMMC_FIFOTH;
++		else
++			val &= ~RTD_FIFOTH_MSIZE;
++		break;
++	case SDMMC_CDTHRCTL:
++		/*
++		 * ... and always enable the 512-byte card read threshold, so
++		 * that a block read only starts when the FIFO can take it.
++		 * dw_mmc disables it below HS200.
++		 */
++		val = RTD_EMMC_CDTHRCTL;
++		break;
++	}
++
++	flags = rtd_lock();
++	rtd_bus_sync(priv);
++	writel_relaxed(val, host->regs + reg);
++
++	/*
++	 * The vendor driver re-writes CMDARG and CLKDIV until they read back
++	 * correctly. Keep that and count the misses.
++	 */
++	if (reg == SDMMC_CMDARG || reg == SDMMC_CLKDIV) {
++		while (readl_relaxed(host->regs + reg) != val && i < 10) {
++			rtd_bus_sync(priv);
++			writel_relaxed(val, host->regs + reg);
++			i++;
++		}
++		priv->rewrites += i;
++	}
++
++	if (reg == SDMMC_CMD && (val & SDMMC_CMD_START) &&
++	    !(val & SDMMC_CMD_UPD_CLK))
++		priv->csd_pending = priv->read_only &&
++				    (val & 0x3f) == MMC_SEND_CSD;
++	rtd_unlock(flags);
++
++	if (i)
++		dev_warn_ratelimited(host->dev,
++				     "register %#x needed %u re-writes\n", reg, i);
++}
++
++static unsigned long dw_mci_rtd129x_fifo_begin(struct dw_mci *host)
++{
++	return rtd_lock();
++}
++
++static void dw_mci_rtd129x_fifo_end(struct dw_mci *host, unsigned long cookie)
++{
++	rtd_unlock(cookie);
++}
++
++static const struct dw_mci_reg_ops dw_mci_rtd129x_reg_ops = {
++	.readl		= dw_mci_rtd129x_readl,
++	.writel		= dw_mci_rtd129x_writel,
++	.fifo_begin	= dw_mci_rtd129x_fifo_begin,
++	.fifo_end	= dw_mci_rtd129x_fifo_end,
++};
++
++/*
++ * This IDMAC does not write descriptors back: after a finished transfer
++ * the OWN bit of every descriptor it used is still set. dw_mmc then waits
++ * 100 ms in dw_mci_prepare_desc32() for OWN to clear before the next
++ * transfer, gives up, re-initializes the ring and moves that transfer by
++ * PIO (every second request took about 100 ms). The vendor driver
++ * simply rewrites its descriptors for every transfer. Clear OWN on the
++ * chain (up to the descriptor marked last) once the transfer is over.
++ * Only call this while the IDMAC is idle.
++ */
++static void rtd_clear_own(struct dw_mci_rtd129x *priv)
++{
++	struct dw_mci *host = priv->host;
++	__le32 *desc = host->sg_cpu;
++	unsigned int i, n = 0;
++	u32 des0;
++
++	if (!own_fix || !desc || host->use_dma != TRANS_MODE_IDMAC ||
++	    host->dma_64bit_address)
++		return;
++
++	/* 32-bit descriptors: des0..des3 */
++	for (i = 0; i < host->ring_size; i++, desc += 4) {
++		des0 = le32_to_cpu(READ_ONCE(desc[0]));
++		if (des0 & BIT(31)) {
++			WRITE_ONCE(desc[0], cpu_to_le32(des0 & ~BIT(31)));
++			n++;
++		}
++		if (!des0 || (des0 & BIT(2)))	/* unused, or last (LD) */
++			break;
++	}
++	if (n) {
++		wmb();
++		priv->own_left += n;
++		priv->own_fixups++;
++	}
++}
++
++/*
++ * Glue-built IDMAC chain (replaces dw_mci_idmac_start_dma)
++ *
++ * This IDMAC never writes descriptors back, so dw_mmc's
++ * prepare_desc, which polls OWN before reusing a descriptor, cannot be
++ * used as is. Like the vendor make_sg_des(), build the chain from scratch
++ * for every request: 32-bit descriptors, at most 4 KiB each, des3 = next.
++ * dma_quirks selects vendor-like details for the multi-descriptor
++ * experiments; 0 reproduces dw_mmc's flags and start sequence.
++ */
++struct rtd_idmac_desc {
++	__le32 des0;
++	__le32 des1;
++	__le32 des2;
++	__le32 des3;
++};
++
++#define RTD_DES0_DIC		BIT(1)
++#define RTD_DES0_LD		BIT(2)
++#define RTD_DES0_FS		BIT(3)
++#define RTD_DES0_CH		BIT(4)
++#define RTD_DES0_OWN		BIT(31)
++#define RTD_DESC_MAX_LEN	0x1000
++
++/* Completion without the IDMAC interrupt, for the request in flight */
++static bool rtd_vendor_completion(struct dw_mci_rtd129x *priv)
++{
++	return READ_ONCE(priv->cur_quirks) &
++	       (RTD_DQ_LAST_DIC | RTD_DQ_IDINTEN0);
++}
++
++static int dw_mci_rtd129x_idmac_start(struct dw_mci *host, unsigned int sg_len)
++{
++	struct dw_mci_rtd129x *priv = host->priv;
++	struct rtd_idmac_desc *ring = host->sg_cpu, *desc = NULL;
++	unsigned int quirks = READ_ONCE(dma_quirks);
++	struct mmc_data *data = host->data;
++	unsigned int i, n = 0, len, chunk;
++	u32 addr, des0, temp;
++
++	WRITE_ONCE(priv->cur_quirks, quirks);
++	if (quirks != priv->last_quirks) {
++		priv->last_quirks = quirks;
++		dev_info(host->dev, "IDMAC start variant: dma_quirks %#x\n",
++			 quirks);
++	}
++
++	for (i = 0; i < sg_len; i++) {
++		addr = sg_dma_address(&data->sg[i]);
++		len = sg_dma_len(&data->sg[i]);
++		while (len) {
++			if (n >= host->ring_size) {
++				priv->dma_start_errs++;
++				return -EINVAL;	/* dw_mmc falls back to PIO */
++			}
++			chunk = min_t(unsigned int, len, RTD_DESC_MAX_LEN);
++			desc = &ring[n];
++			des0 = RTD_DES0_OWN | RTD_DES0_DIC | RTD_DES0_CH;
++			if (!n)
++				des0 |= RTD_DES0_FS;
++			WRITE_ONCE(desc->des0, cpu_to_le32(des0));
++			WRITE_ONCE(desc->des1, cpu_to_le32(chunk));
++			WRITE_ONCE(desc->des2, cpu_to_le32(addr));
++			WRITE_ONCE(desc->des3, cpu_to_le32(host->sg_dma +
++					sizeof(*desc) * ((n + 1) % host->ring_size)));
++			addr += chunk;
++			len -= chunk;
++			n++;
++		}
++	}
++	if (!desc)
++		return -EINVAL;
++
++	des0 = le32_to_cpu(desc->des0) | RTD_DES0_LD;
++	if (!(quirks & RTD_DQ_LAST_CH))
++		des0 &= ~RTD_DES0_CH;
++	if (!(quirks & RTD_DQ_LAST_DIC))
++		des0 &= ~RTD_DES0_DIC;
++	WRITE_ONCE(desc->des0, cpu_to_le32(des0));
++
++	priv->dma_starts++;
++	priv->dma_descs += n;
++	priv->dma_desc_max = max(priv->dma_desc_max, n);
++
++	/*
++	 * The wrapper DMA_DONE flag is only cleared on the successful
++	 * completion path; after an error or a watchdog stop it can still be
++	 * set. Clear it so that it can only belong to this transfer.
++	 */
++	rtd_wrapper_writel(priv, RTD_EMMC_ISR, RTD_EMMC_ISR_DMA_DONE);
++
++	/* descriptors in (uncached) memory before the IDMAC is started */
++	wmb();
++
++	if (!(quirks & RTD_DQ_NO_RESET)) {
++		/* dw_mmc: reset in case PIO ran before */
++		temp = mci_readl(host, CTRL);
++		mci_writel(host, CTRL, temp | SDMMC_CTRL_DMA_RESET);
++		if (read_poll_timeout_atomic(dw_mci_readl, temp,
++					     !(temp & SDMMC_CTRL_DMA_RESET),
++					     1, 500 * USEC_PER_MSEC, false,
++					     host, SDMMC_CTRL)) {
++			priv->dma_start_errs++;
++			return -EIO;
++		}
++		mci_writel(host, BMOD, mci_readl(host, BMOD) |
++			   SDMMC_IDMAC_SWRESET);
++	}
++
++	mci_writel(host, IDINTEN, (quirks & RTD_DQ_IDINTEN0) ? 0 :
++		   SDMMC_IDMAC_INT_NI | SDMMC_IDMAC_INT_RI |
++		   SDMMC_IDMAC_INT_TI);
++	if (quirks & RTD_DQ_DBADDR)
++		mci_writel(host, DBADDR, host->sg_dma);
++
++	mci_writel(host, CTRL, mci_readl(host, CTRL) | SDMMC_CTRL_USE_IDMAC);
++	wmb();
++	mci_writel(host, BMOD, (mci_readl(host, BMOD) | SDMMC_IDMAC_ENABLE) &
++		   ~SDMMC_IDMAC_FB);
++
++	if (!(quirks & RTD_DQ_NO_PLDMND))
++		mci_writel(host, PLDMND, 1);
++
++	return 0;
++}
++
++/*
++ * The vendor driver waits for the wrapper DMA_DONE flag after a read before
++ * it hands the buffer back. dw_mmc waits for the IDMAC receive interrupt;
++ * also wait (briefly) for DMA_DONE, and clear it for the next transfer.
++ */
++static void dw_mci_rtd129x_dma_complete(struct dw_mci *host,
++					struct mmc_data *data)
++{
++	struct dw_mci_rtd129x *priv = host->priv;
++	unsigned int i;
++	u32 isr;
++
++	isr = rtd_wrapper_readl(priv, RTD_EMMC_ISR);
++	if (data->flags & MMC_DATA_READ) {
++		/* hard IRQ context: keep this short (DMA_DONE is normally set) */
++		for (i = 0; !(isr & RTD_EMMC_ISR_DMA_DONE) && i < 20; i++) {
++			udelay(1);
++			isr = rtd_wrapper_readl(priv, RTD_EMMC_ISR);
++		}
++		if (!(isr & RTD_EMMC_ISR_DMA_DONE)) {
++			priv->dma_done_timeouts++;
++			dev_warn_once(host->dev,
++				      "no wrapper DMA_DONE after IDMAC completion\n");
++		}
++	}
++
++	if (isr & RTD_EMMC_ISR_DMA_DONE)
++		rtd_wrapper_writel(priv, RTD_EMMC_ISR, RTD_EMMC_ISR_DMA_DONE);
++
++	if (priv->dump_count < READ_ONCE(trace)) {
++		struct rtd_idmac_desc *d = host->sg_cpu;
++
++		priv->dump_count++;
++		dev_info(host->dev,
++			 "desc0 %08x %08x %08x %08x desc1 %08x %08x %08x %08x IDSTS %#x DSCADDR %#x BUFADDR %#x DBADDR %#x\n",
++			 le32_to_cpu(d[0].des0), le32_to_cpu(d[0].des1),
++			 le32_to_cpu(d[0].des2), le32_to_cpu(d[0].des3),
++			 le32_to_cpu(d[1].des0), le32_to_cpu(d[1].des1),
++			 le32_to_cpu(d[1].des2), le32_to_cpu(d[1].des3),
++			 mci_readl(host, IDSTS), mci_readl(host, DSCADDR),
++			 mci_readl(host, BUFADDR), mci_readl(host, DBADDR));
++	}
++
++	/* the IDMAC reported completion: it is done with the chain */
++	rtd_clear_own(priv);
++}
++
++/*
++ * Request filter
++ *
++ * Read-only mode passes only the commands that the MMC core needs to
++ * identify the card and read from it. Independent of the mode, CMD5
++ * (sleep) and CMD15 (inactive) are refused: the board cannot power-cycle
++ * the eMMC, and the vendor U-Boot must find it awake after a warm reboot.
++ */
++static bool rtd_switch_allowed(struct mmc_host *mmc, u32 arg)
++{
++	u8 mode = (arg >> 24) & 0x3;
++	u8 index = (arg >> 16) & 0xff;
++	u8 value = (arg >> 8) & 0xff;
++
++	if (mode != MMC_SWITCH_MODE_WRITE_BYTE)
++		return false;
++
++	switch (index) {
++	case EXT_CSD_FLUSH_CACHE:
++	case EXT_CSD_CACHE_CTRL:
++	case EXT_CSD_POWER_OFF_NOTIFICATION:
++	case EXT_CSD_HPI_MGMT:
++	case EXT_CSD_ERASE_GROUP_DEF:
++	case EXT_CSD_BUS_WIDTH:
++	case EXT_CSD_HS_TIMING:
++	case EXT_CSD_POWER_CLASS:
++		return true;
++	case EXT_CSD_PART_CONFIG:
++		/*
++		 * Card init switches back to the user area with the boot
++		 * bits it read from EXT_CSD. Afterwards (ioctl users need
++		 * the block device, so a card) only the partition access
++		 * bits may change, never the boot configuration.
++		 */
++		if (!mmc->card)
++			return true;
++		return (value & ~EXT_CSD_PART_CONFIG_ACC_MASK) ==
++		       (mmc->card->ext_csd.part_config &
++			~EXT_CSD_PART_CONFIG_ACC_MASK);
++	}
++
++	return false;
++}
++
++static bool rtd_cmd_allowed(struct mmc_host *mmc, struct mmc_command *cmd)
++{
++	switch (cmd->opcode) {
++	case MMC_GO_IDLE_STATE:
++	case MMC_SEND_OP_COND:
++	case MMC_ALL_SEND_CID:
++	case MMC_SET_RELATIVE_ADDR:
++	case MMC_SELECT_CARD:
++	case MMC_SEND_EXT_CSD:
++	case MMC_SEND_CSD:
++	case MMC_SEND_CID:
++	case MMC_STOP_TRANSMISSION:
++	case MMC_SEND_STATUS:
++	case MMC_BUS_TEST_R:
++	case MMC_SET_BLOCKLEN:
++	case MMC_READ_SINGLE_BLOCK:
++	case MMC_READ_MULTIPLE_BLOCK:
++	case MMC_SEND_TUNING_BLOCK_HS200:
++	case MMC_SET_BLOCK_COUNT:
++	case MMC_SEND_WRITE_PROT:
++	case RTD_MMC_SEND_WRITE_PROT_TYPE:
++		return true;
++	case MMC_SWITCH:
++		return rtd_switch_allowed(mmc, cmd->arg);
++	case MMC_GEN_CMD:
++		return cmd->arg & 1;	/* read direction only */
++	}
++
++	return false;
++}
++
++/*
++ * Writes enabled: data writes and erases (for discard) pass in the user
++ * area only, with write_min_lba guarding it below a block address.
++ * Refused are the boot configuration and the irreversible commands:
++ * EXT_CSD writes outside the init list, CMD26/27 (program CID/CSD),
++ * CMD28/29 (write protect), CMD42 (lock), the vendor commands CMD60-63,
++ * and every CMD24/CMD25 data write and every erase while a boot, RPMB or
++ * general purpose partition is selected. That covers RPMB key
++ * programming, a CMD25 data frame on the RPMB partition (and also the
++ * RPMB request frames, so RPMB cannot be used at all). The boot1_writes
++ * test switch lets plain CMD24/CMD25 writes to boot1 pass, as in
++ * read-only mode.
++ */
++static int rtd_write_mode_check(struct dw_mci_rtd129x *priv,
++				struct mmc_host *mmc, struct mmc_request *mrq)
++{
++	struct mmc_command *cmd = mrq->cmd;
++	unsigned int min = READ_ONCE(write_min_lba);
++	unsigned int part = mmc->card ? mmc->card->ext_csd.part_config &
++					EXT_CSD_PART_CONFIG_ACC_MASK : 0;
++
++	switch (cmd->opcode) {
++	case MMC_SWITCH:
++		return rtd_switch_allowed(mmc, cmd->arg) ? 0 : -EPERM;
++	case MMC_PROGRAM_CID:
++	case MMC_PROGRAM_CSD:
++	case MMC_SET_WRITE_PROT:
++	case MMC_CLR_WRITE_PROT:
++	case MMC_LOCK_UNLOCK:
++	case 60 ... 63:
++		return -EPERM;
++	case MMC_WRITE_BLOCK:
++	case MMC_WRITE_MULTIPLE_BLOCK:
++		if (part == EXT_CSD_PART_CONFIG_ACC_RPMB)
++			return -EPERM;
++		if (part) {
++			if (!rtd_boot1_selected(priv->host))
++				return -EROFS;
++			priv->boot1_writes_done++;
++			return 0;
++		}
++		if (min && cmd->arg < min)
++			return -EROFS;
++		break;
++	case MMC_ERASE_GROUP_START:
++		if (part == EXT_CSD_PART_CONFIG_ACC_RPMB)
++			return -EPERM;
++		if (part || (min && cmd->arg < min))
++			return -EROFS;
++		break;
++	case MMC_ERASE_GROUP_END:
++	case MMC_ERASE:
++		if (part == EXT_CSD_PART_CONFIG_ACC_RPMB)
++			return -EPERM;
++		if (part)
++			return -EROFS;
++		break;
++	}
++
++	return 0;
++}
++
++static int rtd_mrq_check(struct dw_mci_rtd129x *priv, struct mmc_host *mmc,
++			 struct mmc_request *mrq)
++{
++	struct mmc_command *cmd = mrq->cmd;
++
++	if (cmd->opcode == MMC_SLEEP_AWAKE || cmd->opcode == MMC_GO_INACTIVE_STATE)
++		return -EPERM;
++
++	if (!priv->read_only)
++		return rtd_write_mode_check(priv, mmc, mrq);
++
++	if (mrq->data && (mrq->data->flags & MMC_DATA_WRITE)) {
++		/* boot1 test mode: plain block writes to boot1 only */
++		if (!rtd_boot1_selected(priv->host) ||
++		    (cmd->opcode != MMC_WRITE_BLOCK &&
++		     cmd->opcode != MMC_WRITE_MULTIPLE_BLOCK) ||
++		    (mrq->sbc && mrq->sbc->opcode != MMC_SET_BLOCK_COUNT))
++			return -EROFS;
++		priv->boot1_writes_done++;
++		return 0;
++	}
++	if (mrq->sbc && !rtd_cmd_allowed(mmc, mrq->sbc))
++		return -EROFS;
++	if (!rtd_cmd_allowed(mmc, cmd))
++		return -EROFS;
++
++	return 0;
++}
++
++/*
++ * Per data request accounting. mrq->done is wrapped to see the end of the
++ * request; mrq->host (only used by the CQE paths of the core) carries the
++ * host to the wrapper. dw_mmc handles one request at a time.
++ */
++static void rtd_trace_done(struct mmc_request *mrq)
++{
++	struct dw_mci_slot *slot = mmc_priv(mrq->host);
++	struct dw_mci_rtd129x *priv = slot->host->priv;
++	void (*done)(struct mmc_request *mrq) = priv->tr_done;
++	struct mmc_data *data = mrq->data;
++	u32 lat = rtd_us_since(priv->tr_t0);
++	int derr = data ? data->error : 0;
++	int cerr = mrq->cmd->error;
++
++	priv->lat_sum_us += lat;
++	priv->lat_max_us = max(priv->lat_max_us, lat);
++	if (cerr || (mrq->sbc && mrq->sbc->error))
++		priv->cmd_errs++;
++	if (slot->host->use_dma == TRANS_MODE_IDMAC &&
++	    (priv->tr_mintsts & (SDMMC_INT_RXDR | SDMMC_INT_TXDR)))
++		priv->pio_fallbacks++;
++	if (derr == -ETIMEDOUT)
++		priv->data_err_timeout++;
++	else if (derr == -EILSEQ)
++		priv->data_err_crc++;
++	else if (derr)
++		priv->data_err_other++;
++
++	if (priv->tr_count < trace || lat > 200 * USEC_PER_MSEC) {
++		if (priv->tr_count < trace)
++			priv->tr_count++;
++		dev_info_ratelimited(slot->host->dev,
++				     "trace CMD%u arg %#x %ux%u%s: cmd %u dto %u idmac %u done %u us, busy reads %u, mintsts %#x%s%s, err cmd %d data %d\n",
++				     mrq->cmd->opcode, mrq->cmd->arg,
++				     data ? data->blocks : 0,
++				     data ? data->blksz : 0,
++				     mrq->sbc ? " +CMD23" : "",
++				     priv->tr_cmd_us, priv->tr_dto_us,
++				     priv->tr_ri_us, lat, priv->tr_busy_reads,
++				     priv->tr_mintsts,
++				     priv->tr_kicked ? " kicked" : "",
++				     priv->tr_polled ? " polled" : "",
++				     cerr, derr);
++	}
++
++	WRITE_ONCE(priv->tr_mrq, NULL);
++	mrq->done = done;
++	if (done)
++		done(mrq);
++}
++
++static void rtd_trace_start(struct dw_mci_rtd129x *priv, struct mmc_host *mmc,
++			    struct mmc_request *mrq)
++{
++	if (mrq->done == rtd_trace_done) {
++		/* the core re-issues a request with retries left */
++		priv->data_retries++;
++		priv->tr_t0 = ktime_get_ns();
++		return;
++	}
++	if (READ_ONCE(priv->tr_mrq))
++		return;		/* not expected: one request at a time */
++
++	priv->data_reqs++;
++	priv->tr_cmd_us = 0;
++	priv->tr_dto_us = 0;
++	priv->tr_ri_us = 0;
++	priv->tr_mintsts = 0;
++	priv->tr_busy_reads = 0;
++	priv->tr_kicked = false;
++	priv->tr_polled = false;
++	priv->tr_done = mrq->done;
++	mrq->host = mmc;
++	mrq->done = rtd_trace_done;
++	priv->tr_t0 = ktime_get_ns();
++	WRITE_ONCE(priv->tr_mrq, mrq);
++}
++
++/*
++ * Limit for a data request that sees no DTO at all. A legal transfer can
++ * take up to the card's data timeout per block (busy time between write
++ * blocks included), so scale with the request; never less than
++ * RTD_WD_TIMEOUT_MS, never more than the block layer request timeout.
++ */
++static unsigned long rtd_wd_no_dto_limit(struct mmc_data *data)
++{
++	u64 ms = div_u64((u64)data->timeout_ns * data->blocks, NSEC_PER_MSEC);
++
++	ms = clamp_t(u64, ms + RTD_WD_TIMEOUT_MS, RTD_WD_TIMEOUT_MS,
++		     RTD_WD_NO_DTO_MAX_MS);
++
++	return msecs_to_jiffies(ms);
++}
++
++static void dw_mci_rtd129x_request(struct mmc_host *mmc,
++				   struct mmc_request *mrq)
++{
++	struct dw_mci_slot *slot = mmc_priv(mmc);
++	struct dw_mci_rtd129x *priv = slot->host->priv;
++	int err;
++
++	err = rtd_mrq_check(priv, mmc, mrq);
++	if (!err) {
++		if (mrq->data) {
++			struct dw_mci *host = slot->host;
++
++			/* after errors/stops too: clear leftovers while idle */
++			spin_lock_bh(&host->lock);
++			if (!host->mrq && host->state == STATE_IDLE)
++				rtd_clear_own(priv);
++			spin_unlock_bh(&host->lock);
++
++			rtd_trace_start(priv, mmc, mrq);
++			WRITE_ONCE(priv->wd_no_dto_limit,
++				   rtd_wd_no_dto_limit(mrq->data));
++			WRITE_ONCE(priv->wd_dto_seen, false);
++			WRITE_ONCE(priv->wd_start, jiffies);
++			WRITE_ONCE(priv->wd_mrq, mrq);
++			if (watchdog || kick ||
++			    (READ_ONCE(dma_quirks) &
++			     (RTD_DQ_LAST_DIC | RTD_DQ_IDINTEN0)))
++				mod_delayed_work(system_wq, &priv->wd_work,
++						 msecs_to_jiffies(RTD_WD_POLL_MS));
++		}
++		priv->request(mmc, mrq);
++		return;
++	}
++
++	dev_err_ratelimited(slot->host->dev,
++			    "%s: refusing CMD%u arg %#010x%s (%d)\n",
++			    priv->read_only ? "read-only" : "filter",
++			    mrq->cmd->opcode, mrq->cmd->arg,
++			    mrq->data && (mrq->data->flags & MMC_DATA_WRITE) ?
++			    " (data write)" : "", err);
++
++	mrq->cmd->error = err;
++	mrq->cmd->retries = 0;
++	if (mrq->data) {
++		mrq->data->error = err;
++		mrq->data->bytes_xfered = 0;
++	}
++	mmc_request_done(mmc, mrq);
++}
++
++/*
++ * Data request watchdog
++ *
++ * dw_mmc has no timeout for "data over (DTO) arrived, but the IDMAC never
++ * reported completion": it waits forever, and so does the boot when that
++ * happens during the partition scan. While a data request is in flight,
++ * poll every RTD_WD_POLL_MS:
++ *
++ * - DTO seen, IDMAC completion missing, but the hardware shows the DMA is
++ *   done (IDSTS RI/TI; or wrapper DMA_DONE with TBBCNT >= BYTCNT, which is
++ *   what the vendor driver checks; without the vendor completion quirks
++ *   only after RTD_WD_DMA_DONE_MS): complete the DMA as the interrupt
++ *   handler would. Counted in polled_completions.
++ * - DTO seen, but the DMA still not done RTD_WD_TIMEOUT_MS after the
++ *   request started (and at least RTD_WD_DMA_DONE_MS after the DTO): dump
++ *   the registers, stop the DMA and fail the data with -ETIMEDOUT. This is
++ *   the hang the watchdog exists for.
++ * - No DTO at all: fail the same way, like dw_mmc's own DTO timer, but
++ *   only after the limit from rtd_wd_no_dto_limit(), so slow but legal
++ *   transfers (large writes to a busy card) are not cut short.
++ *
++ * The controller interrupt is disabled while the work looks at the state,
++ * so the handler and the work never both complete the DMA.
++ */
++static void dw_mci_rtd129x_wd_work(struct work_struct *work)
++{
++	struct dw_mci_rtd129x *priv = container_of(to_delayed_work(work),
++						   struct dw_mci_rtd129x,
++						   wd_work);
++	struct mmc_request *mrq = READ_ONCE(priv->wd_mrq);
++	struct dw_mci *host = priv->host;
++	bool finished = false, complete = false, timeout = false, dto;
++	u32 regs[12] = { 0 };
++	unsigned long flags, events = 0;
++	enum dw_mci_state state;
++	u32 idsts = 0, isr = 0, bytcnt = 0, tbbcnt = 0;
++	u32 pend;
++
++	/* Nothing tracked: the request finished or the host is going away */
++	if (!mrq)
++		return;
++
++	disable_irq(host->irq);
++
++	/*
++	 * Lost interrupts: if the controller shows status the handler has not
++	 * seen, run the handler. With the IRQ disabled and local IRQs off it
++	 * cannot race with a real interrupt.
++	 */
++	if (kick && host->mrq == mrq) {
++		local_irq_save(flags);
++		WRITE_ONCE(priv->in_wd, true);
++		pend = mci_readl(host, MINTSTS);
++		if (host->use_dma == TRANS_MODE_IDMAC)
++			pend |= mci_readl(host, IDSTS) &
++				(SDMMC_IDMAC_INT_TI | SDMMC_IDMAC_INT_RI);
++		WRITE_ONCE(priv->in_wd, false);
++		if (pend) {
++			priv->kicks++;
++			if (priv->tr_mrq)
++				priv->tr_kicked = true;
++			WRITE_ONCE(priv->kicking, true);
++			dw_mci_handle_pending_irq(host);
++			WRITE_ONCE(priv->kicking, false);
++		}
++		local_irq_restore(flags);
++	}
++
++	spin_lock_bh(&host->lock);
++	spin_lock_irqsave(&host->irq_lock, flags);
++	WRITE_ONCE(priv->in_wd, true);
++
++	state = host->state;
++	/* host->data is NULL while CMD23 runs: keep watching then */
++	if (host->mrq != mrq || state == STATE_IDLE) {
++		/* never match a later request that reuses this one's memory */
++		cmpxchg(&priv->wd_mrq, mrq, NULL);
++		finished = true;
++		goto unlock;
++	}
++
++	if (!watchdog && !rtd_vendor_completion(priv))
++		goto unlock;
++
++	events = host->pending_events;
++	if (host->data && test_bit(EVENT_DATA_COMPLETE, &host->pending_events) &&
++	    !test_bit(EVENT_XFER_COMPLETE, &host->pending_events) &&
++	    !test_bit(EVENT_DATA_ERROR, &host->pending_events)) {
++		idsts = mci_readl(host, IDSTS);
++		isr = rtd_wrapper_readl(priv, RTD_EMMC_ISR);
++		bytcnt = mci_readl(host, BYTCNT);
++		tbbcnt = mci_readl(host, TBBCNT);
++		/*
++		 * IDSTS RI/TI is authoritative. Otherwise use the vendor
++		 * criterion: wrapper DMA_DONE (reads only) and TBBCNT >=
++		 * BYTCNT. idmac_start() clears DMA_DONE, so it always belongs
++		 * to this transfer. With the vendor completion quirks (the
++		 * default) the vendor criterion is accepted at once, as in
++		 * the vendor driver; without them only RTD_WD_DMA_DONE_MS
++		 * after the request started.
++		 */
++		bool dma_done = (isr & RTD_EMMC_ISR_DMA_DONE) ||
++				(host->data->flags & MMC_DATA_WRITE);
++
++		if ((idsts & (SDMMC_IDMAC_INT_TI | SDMMC_IDMAC_INT_RI)) ||
++		    (dma_done && tbbcnt >= bytcnt &&
++		     (rtd_vendor_completion(priv) ||
++		      time_after(jiffies, READ_ONCE(priv->wd_start) +
++				 msecs_to_jiffies(RTD_WD_DMA_DONE_MS))))) {
++			if (rtd_vendor_completion(priv))
++				priv->vendor_completions++;
++			mci_writel(host, IDSTS, SDMMC_IDMAC_INT_TI |
++				   SDMMC_IDMAC_INT_RI);
++			mci_writel(host, IDSTS, SDMMC_IDMAC_INT_NI);
++			complete = true;
++			priv->polled_completions++;
++			if (priv->tr_mrq)
++				priv->tr_polled = true;
++			goto unlock;
++		}
++	}
++
++	dto = host->data &&
++	      test_bit(EVENT_DATA_COMPLETE, &host->pending_events) &&
++	      !test_bit(EVENT_XFER_COMPLETE, &host->pending_events) &&
++	      !test_bit(EVENT_DATA_ERROR, &host->pending_events);
++	if (dto && !priv->wd_dto_seen) {
++		priv->wd_dto_at = jiffies;
++		priv->wd_dto_seen = true;
++	}
++	if (dto) {
++		/* also give a late but legal DTO time for its DMA to finish */
++		if (!time_after(jiffies, READ_ONCE(priv->wd_start) +
++				msecs_to_jiffies(RTD_WD_TIMEOUT_MS)) ||
++		    !time_after(jiffies, priv->wd_dto_at +
++				msecs_to_jiffies(RTD_WD_DMA_DONE_MS)))
++			goto unlock;
++	} else if (!time_after(jiffies, READ_ONCE(priv->wd_start) +
++			       READ_ONCE(priv->wd_no_dto_limit))) {
++		goto unlock;
++	}
++
++	timeout = true;
++	priv->watchdog_timeouts++;
++	regs[0] = mci_readl(host, CTRL);
++	regs[1] = mci_readl(host, STATUS);
++	regs[2] = mci_readl(host, RINTSTS);
++	regs[3] = mci_readl(host, MINTSTS);
++	regs[4] = mci_readl(host, INTMASK);
++	regs[5] = mci_readl(host, IDSTS);
++	regs[6] = mci_readl(host, IDINTEN);
++	regs[7] = mci_readl(host, BMOD);
++	regs[8] = mci_readl(host, CMD);
++	regs[9] = mci_readl(host, BYTCNT);
++	regs[10] = mci_readl(host, TBBCNT);
++	regs[11] = rtd_wrapper_readl(priv, RTD_EMMC_ISR);
++
++	if (dto) {
++		/* DTO came, the DMA did not finish: stop it, fail the data */
++		host->data_status |= SDMMC_INT_DRTO;
++		host->dma_ops->stop(host);
++		host->dma_ops->cleanup(host);
++		set_bit(EVENT_XFER_COMPLETE, &host->pending_events);
++		queue_work(system_bh_wq, &host->bh_work);
++	} else if (host->data &&
++		   (state == STATE_SENDING_DATA || state == STATE_DATA_BUSY) &&
++		   !test_bit(EVENT_DATA_COMPLETE, &host->pending_events)) {
++		/* No DTO at all: what dw_mmc's DTO timer does */
++		host->data_status = SDMMC_INT_DRTO;
++		set_bit(EVENT_DATA_ERROR, &host->pending_events);
++		set_bit(EVENT_DATA_COMPLETE, &host->pending_events);
++		queue_work(system_bh_wq, &host->bh_work);
++	}
++
++unlock:
++	WRITE_ONCE(priv->in_wd, false);
++	spin_unlock_irqrestore(&host->irq_lock, flags);
++	spin_unlock_bh(&host->lock);
++
++	if (complete)
++		host->dma_ops->complete((void *)host);
++
++	enable_irq(host->irq);
++
++	if (complete)
++		dev_warn_once(host->dev,
++			      "IDMAC completion by polling: IDSTS %#x ISR %#x BYTCNT %#x TBBCNT %#x\n",
++			      idsts, isr, bytcnt, tbbcnt);
++
++	if (timeout)
++		dev_err(host->dev,
++			"data request stuck (state %d events %#lx): CTRL %#x STATUS %#x RINTSTS %#x MINTSTS %#x INTMASK %#x IDSTS %#x IDINTEN %#x BMOD %#x CMD %#x BYTCNT %#x TBBCNT %#x ISR %#x\n",
++			state, events, regs[0], regs[1], regs[2], regs[3],
++			regs[4], regs[5], regs[6], regs[7], regs[8], regs[9],
++			regs[10], regs[11]);
++
++	if (!finished && !timeout)
++		mod_delayed_work(system_wq, &priv->wd_work,
++				 msecs_to_jiffies(RTD_WD_POLL_MS));
++}
++
++/* Fixed 1.8 V I/O; there is no regulator to switch */
++static int dw_mci_rtd129x_switch_voltage(struct mmc_host *mmc,
++					 struct mmc_ios *ios)
++{
++	return ios->signal_voltage == MMC_SIGNAL_VOLTAGE_120 ? -EINVAL : 0;
++}
++
++static void dw_mci_rtd129x_unmap(void *data)
++{
++	struct dw_mci_rtd129x *priv = data;
++
++	iounmap(priv->sb2);
++}
++
++static int dw_mci_rtd129x_parse_dt(struct dw_mci *host)
++{
++	struct device_node *np = host->dev->of_node;
++	struct dw_mci_rtd129x *priv;
++	struct device_node *sb2_np;
++	int ret, i;
++
++	priv = devm_kzalloc(host->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->host = host;
++
++	priv->crt = syscon_regmap_lookup_by_phandle(np, "realtek,crt-syscon");
++	if (IS_ERR(priv->crt))
++		return dev_err_probe(host->dev, PTR_ERR(priv->crt),
++				     "failed to get CRT syscon\n");
++
++	/* The SB2 sync register is written from atomic context: map it */
++	sb2_np = of_parse_phandle(np, "realtek,sb2-syscon", 0);
++	if (!sb2_np)
++		return dev_err_probe(host->dev, -ENODEV,
++				     "failed to get SB2 syscon\n");
++	priv->sb2 = of_iomap(sb2_np, 0);
++	of_node_put(sb2_np);
++	if (!priv->sb2)
++		return dev_err_probe(host->dev, -ENOMEM, "failed to map SB2\n");
++
++	ret = devm_add_action_or_reset(host->dev, dw_mci_rtd129x_unmap, priv);
++	if (ret)
++		return ret;
++
++	priv->read_only = of_property_read_bool(np, "realtek,read-only") &&
++			  !allow_writes;
++
++	/* Vendor TS-328 DT pddrive_nf_s0 (SDR50): clk, cmd, data 0x77, DS 0x33 */
++	priv->drive_hs[RTD_DRV_CLK] = 0x77;
++	priv->drive_hs[RTD_DRV_CMD] = 0x77;
++	priv->drive_hs[RTD_DRV_DATA] = 0x77;
++	priv->drive_hs[RTD_DRV_DS] = 0x33;
++	ret = of_property_read_u32_array(np, "realtek,drive-hs", priv->drive_hs,
++					 RTD_DRV_NUM);
++	if (ret && ret != -EINVAL)
++		return dev_err_probe(host->dev, ret,
++				     "invalid realtek,drive-hs\n");
++	for (i = 0; i < RTD_DRV_NUM; i++)
++		if (priv->drive_hs[i] > 0xff)
++			return dev_err_probe(host->dev, -EINVAL,
++					     "invalid realtek,drive-hs\n");
++
++	INIT_DELAYED_WORK(&priv->wd_work, dw_mci_rtd129x_wd_work);
++
++	host->priv = priv;
++
++	return 0;
++}
++
++static int rtd_crt_update(struct dw_mci_rtd129x *priv, u32 reg, u32 mask,
++			  u32 val)
++{
++	return regmap_update_bits(priv->crt, reg, mask, val);
++}
++
++/* Vendor phase(): select sample/drive phase 0 for SDR modes */
++static int dw_mci_rtd129x_set_phase(struct dw_mci_rtd129x *priv)
++{
++	u32 ckgen;
++	int ret;
++
++	ckgen = rtd_wrapper_readl(priv, RTD_EMMC_CKGEN_CTL);
++	rtd_wrapper_writel(priv, RTD_EMMC_CKGEN_CTL,
++			   ckgen | RTD_EMMC_CKGEN_SRC_4MHZ);
++
++	ret = rtd_crt_update(priv, RTD_CRT_PLL_EMMC1, RTD_PLL_EMMC1_RSTB, 0);
++	if (!ret)
++		ret = rtd_crt_update(priv, RTD_CRT_PLL_EMMC1,
++				     RTD_PLL_EMMC1_PHASE0 |
++				     RTD_PLL_EMMC1_PHASE1, 0);
++	if (!ret)
++		ret = rtd_crt_update(priv, RTD_CRT_PLL_EMMC1,
++				     RTD_PLL_EMMC1_RSTB, RTD_PLL_EMMC1_RSTB);
++	usleep_range(200, 300);
++
++	rtd_wrapper_writel(priv, RTD_EMMC_CKGEN_CTL,
++			   ckgen & ~RTD_EMMC_CKGEN_SRC_4MHZ);
++
++	return ret;
++}
++
++/* Vendor rtkemmc_set_freq() for revision A01 and later */
++static int dw_mci_rtd129x_set_pll(struct dw_mci_rtd129x *priv, u32 n)
++{
++	u32 dummy;
++	int ret;
++
++	ret = rtd_crt_update(priv, RTD_CRT_CLOCK_ENABLE1,
++			     RTD_CRT_CLK_EN_EMMC_IP, 0);
++	if (ret)
++		return ret;
++
++	/* Keep only bits 2:1, as the vendor driver does */
++	ret = rtd_crt_update(priv, RTD_CRT_PLL_EMMC4,
++			     (u32)~RTD_PLL_EMMC4_KEEP, 0);
++	if (!ret)
++		ret = rtd_crt_update(priv, RTD_CRT_PLL_EMMC3, RTD_PLL_EMMC3_N,
++				     FIELD_PREP(RTD_PLL_EMMC3_N, n));
++	if (!ret)
++		ret = rtd_crt_update(priv, RTD_CRT_PLL_EMMC4,
++				     RTD_PLL_EMMC4_ON, RTD_PLL_EMMC4_ON);
++
++	/* A01 ECO: toggle DUMMY_SYS bit 30 when the N/F code changes */
++	dummy = rtd_wrapper_readl(priv, RTD_EMMC_DUMMY_SYS);
++	rtd_wrapper_writel(priv, RTD_EMMC_DUMMY_SYS,
++			   dummy ^ RTD_EMMC_DUMMY_SYS_PLL_UPDATE);
++
++	usleep_range(400, 500);
++
++	/* Ungate the IP clock even if a PLL write failed */
++	if (rtd_crt_update(priv, RTD_CRT_CLOCK_ENABLE1, RTD_CRT_CLK_EN_EMMC_IP,
++			   RTD_CRT_CLK_EN_EMMC_IP) && !ret)
++		ret = -EIO;
++
++	return ret;
++}
++
++/* Vendor rtkemmc_set_pad_driving() */
++static void rtd_set_drive(struct dw_mci_rtd129x *priv, bool hs)
++{
++	u32 clk = RTD_EMMC_PDRIVE_INIT, cmd = clk, data = clk, ds = clk;
++	u32 val;
++
++	if (hs) {
++		clk = priv->drive_hs[RTD_DRV_CLK];
++		cmd = priv->drive_hs[RTD_DRV_CMD];
++		data = priv->drive_hs[RTD_DRV_DATA];
++		ds = priv->drive_hs[RTD_DRV_DS];
++	}
++
++	val = data * 0x01010101;
++	rtd_wrapper_writel(priv, RTD_EMMC_PDRIVE_NF1, val);	/* D0-D3 */
++	rtd_wrapper_writel(priv, RTD_EMMC_PDRIVE_NF2, val);	/* D4-D7 */
++	val = rtd_wrapper_readl(priv, RTD_EMMC_PDRIVE_NF3) & 0x00ff00ff;
++	rtd_wrapper_writel(priv, RTD_EMMC_PDRIVE_NF3,
++			   val | clk << 8 | cmd << 24);
++	rtd_wrapper_writel(priv, RTD_EMMC_PDRIVE_NF4, ds);
++	priv->drive_is_hs = hs;
++}
++
++static void dw_mci_rtd129x_set_ios(struct dw_mci *host, struct mmc_ios *ios)
++{
++	struct dw_mci_rtd129x *priv = host->priv;
++	bool hs = ios->clock > 26000000;
++
++	if (hs == priv->drive_is_hs)
++		return;
++
++	rtd_set_drive(priv, hs);
++	dev_dbg(host->dev, "pad drive %s for %u Hz: NF1 %#x NF3 %#x NF4 %#x\n",
++		hs ? "high-speed" : "init", ios->clock,
++		rtd_wrapper_readl(priv, RTD_EMMC_PDRIVE_NF1),
++		rtd_wrapper_readl(priv, RTD_EMMC_PDRIVE_NF3),
++		rtd_wrapper_readl(priv, RTD_EMMC_PDRIVE_NF4));
++}
++
++static int dw_mci_rtd129x_init(struct dw_mci *host)
++{
++	struct dw_mci_rtd129x *priv = host->priv;
++	u32 rst, clk, rev, mux, val, pll[4];
++	int ret;
++
++	rev = readl(priv->sb2 + RTD_SB2_CHIP_REV);
++	if (rev < RTD129X_REV_A01) {
++		dev_err(host->dev, "chip revision %#x not supported\n", rev);
++		return -ENODEV;
++	}
++
++	ret = regmap_read(priv->crt, RTD_CRT_SOFT_RESET2, &rst);
++	if (!ret)
++		ret = regmap_read(priv->crt, RTD_CRT_CLOCK_ENABLE1, &clk);
++	if (ret)
++		return ret;
++
++	if (!(rst & RTD_CRT_RSTN_EMMC)) {
++		dev_err(host->dev, "controller is held in reset (SOFT_RESET2 %#x)\n",
++			rst);
++		return -ENODEV;
++	}
++
++	if ((clk & (RTD_CRT_CLK_EN_EMMC | RTD_CRT_CLK_EN_EMMC_IP)) !=
++	    (RTD_CRT_CLK_EN_EMMC | RTD_CRT_CLK_EN_EMMC_IP)) {
++		dev_warn(host->dev, "enabling gated eMMC clocks (CLOCK_ENABLE1 %#x)\n",
++			 clk);
++		ret = rtd_crt_update(priv, RTD_CRT_CLOCK_ENABLE1,
++				     RTD_CRT_CLK_EN_EMMC | RTD_CRT_CLK_EN_EMMC_IP,
++				     RTD_CRT_CLK_EN_EMMC | RTD_CRT_CLK_EN_EMMC_IP);
++		if (ret)
++			return ret;
++		usleep_range(10, 20);
++	}
++
++	/* From here on every register access takes the RBUS lock */
++	host->reg_ops = &dw_mci_rtd129x_reg_ops;
++
++	/*
++	 * HCON reports a 64-bit host data width. The vendor never touches the
++	 * FIFO from the CPU; if dw_mmc falls back to PIO, use 32-bit
++	 * accesses, which are known to work on RBUS.
++	 */
++	host->quirks |= DW_MMC_QUIRK_FIFO64_32;
++
++	val = mci_readl(host, HCON);
++	if (SDMMC_GET_TRANS_MODE(val) != DMA_INTERFACE_IDMA ||
++	    SDMMC_GET_ADDR_CONFIG(val)) {
++		dev_err(host->dev, "unexpected HCON %#x (need 32-bit IDMAC)\n",
++			val);
++		return -ENODEV;
++	}
++
++	mux = rtd_wrapper_readl(priv, RTD_EMMC_MUXPAD0);
++	dev_info(host->dev,
++		 "rev %#x VERID %#x HCON %#x muxpad0 %#x pfunc_nf1 %#x pad_ctl %#x\n",
++		 rev, mci_readl(host, VERID), val, mux,
++		 rtd_wrapper_readl(priv, RTD_EMMC_PFUNC_NF1),
++		 rtd_wrapper_readl(priv, RTD_EMMC_PAD_CTL));
++	/* No pinctrl driver: rely on U-Boot, which boots from the eMMC */
++	if ((mux & RTD_EMMC_MUXPAD0_EMMC_MASK) != RTD_EMMC_MUXPAD0_EMMC)
++		dev_warn(host->dev, "eMMC pads may not be muxed (muxpad0 %#x)\n",
++			 mux);
++
++	/* Quiesce: mask the wrapper and IP interrupts, clear the status */
++	rtd_wrapper_writel(priv, RTD_EMMC_ISR, RTD_EMMC_ISR_WRITE_DATA |
++			   RTD_EMMC_ISR_DMA_INT_MASK |
++			   RTD_EMMC_ISR_DESC_INT_MASK |
++			   RTD_EMMC_ISR_IP_INT_MASK);
++	mci_writel(host, INTMASK, 0);
++	mci_writel(host, RINTSTS, 0xffffffff);
++	rtd_wrapper_writel(priv, RTD_EMMC_ISR, RTD_EMMC_ISR_DMA_DONE);
++
++	/* U-Boot may have left a transfer busy; give it time to finish */
++	ret = read_poll_timeout(dw_mci_readl, val, !(val & SDMMC_STATUS_BUSY),
++				100, 100 * USEC_PER_MSEC, false, host,
++				SDMMC_STATUS);
++	if (ret)
++		dev_warn(host->dev, "card busy at probe (STATUS %#x)\n", val);
++
++	/* U-Boot runs the card in HS200: undo its HS200/HS400 settings */
++	rtd_wrapper_writel(priv, RTD_EMMC_DDR_REG, 0);
++	rtd_wrapper_writel(priv, RTD_EMMC_DQS_CTRL1, 0);
++	rtd_wrapper_writel(priv, RTD_EMMC_SWC_SEL, 0);
++	rtd_wrapper_writel(priv, RTD_EMMC_CP, 0);
++
++	/* Vendor init drive; set_ios() switches to drive_hs above 26 MHz */
++	rtd_set_drive(priv, false);
++
++	/*
++	 * Leave EMMC_PAD_CTL as U-Boot set it (it runs this card in HS200).
++	 * The vendor kernel writes 0 here; U-Boot leaves 1.
++	 * UHS_REG bit 0 is the 1.8 V signaling bit, set by vendor and U-Boot.
++	 */
++	mci_writel(host, UHS_REG, mci_readl(host, UHS_REG) | BIT(0));
++	mci_writel(host, CDTHRCTL, RTD_EMMC_CDTHRCTL);
++
++	/* Vendor order: wrapper divider, phase, then PLL */
++	rtd_wrapper_writel(priv, RTD_EMMC_CKGEN_CTL, RTD_EMMC_CKGEN_DEFAULT);
++	ret = dw_mci_rtd129x_set_phase(priv);
++	if (ret)
++		return ret;
++
++	ret = dw_mci_rtd129x_set_pll(priv, RTD_EMMC_PLL_N_100MHZ);
++	if (ret)
++		return ret;
++
++	if (host->bus_hz != RTD_EMMC_BUS_HZ)
++		dev_warn(host->dev, "clock-frequency %u ignored, using %u\n",
++			 host->bus_hz, RTD_EMMC_BUS_HZ);
++	host->bus_hz = RTD_EMMC_BUS_HZ;
++
++	ret = regmap_read(priv->crt, RTD_CRT_PLL_EMMC1, &pll[0]);
++	ret = ret ?: regmap_read(priv->crt, RTD_CRT_PLL_EMMC1 + 4, &pll[1]);
++	ret = ret ?: regmap_read(priv->crt, RTD_CRT_PLL_EMMC3, &pll[2]);
++	ret = ret ?: regmap_read(priv->crt, RTD_CRT_PLL_EMMC4, &pll[3]);
++	if (ret)
++		return ret;
++	dev_info(host->dev, "PLL_EMMC1-4 %08x %08x %08x %08x CKGEN %#x\n",
++		 pll[0], pll[1], pll[2], pll[3],
++		 rtd_wrapper_readl(priv, RTD_EMMC_CKGEN_CTL));
++
++	/* Route the IP interrupt; the wrapper DMA/descriptor ones stay off */
++	rtd_wrapper_writel(priv, RTD_EMMC_ISR, RTD_EMMC_ISR_IP_INT_MASK);
++
++	return 0;
++}
++
++static const struct dw_mci_drv_data rtd129x_drv_data = {
++	.init			= dw_mci_rtd129x_init,
++	.parse_dt		= dw_mci_rtd129x_parse_dt,
++	.set_ios		= dw_mci_rtd129x_set_ios,
++	.switch_voltage		= dw_mci_rtd129x_switch_voltage,
++	.dma_complete		= dw_mci_rtd129x_dma_complete,
++};
++
++static int dw_mci_rtd129x_probe(struct platform_device *pdev)
++{
++	struct dw_mci_rtd129x *priv;
++	struct mmc_host *mmc;
++	struct dw_mci *host;
++	int ret;
++
++	ret = dw_mci_pltfm_register(pdev, &rtd129x_drv_data);
++	if (ret)
++		return ret;
++
++	host = platform_get_drvdata(pdev);
++	priv = host->priv;
++	mmc = host->slot->mmc;
++
++	/*
++	 * Filter requests. The card scan has already been queued, but the
++	 * block device only appears after card init, long after this. The
++	 * register accessors refuse writes in the meantime.
++	 */
++	if (max_req_kb) {
++		/*
++		 * The block queue takes these limits when the card is added,
++		 * after card init; the scan queued by dw_mci_probe() cannot
++		 * have got that far yet.
++		 */
++		mmc->max_req_size = min(mmc->max_req_size, max_req_kb * SZ_1K);
++		mmc->max_seg_size = min(mmc->max_seg_size, mmc->max_req_size);
++		mmc->max_segs = min_t(unsigned int, mmc->max_segs,
++				      DIV_ROUND_UP(mmc->max_req_size, SZ_4K));
++		mmc->max_blk_count = mmc->max_req_size / 512;
++		dev_warn(&pdev->dev, "requests limited to %u bytes, %u segments\n",
++			 mmc->max_req_size, mmc->max_segs);
++	}
++	if (host->use_dma == TRANS_MODE_IDMAC && !host->dma_64bit_address) {
++		spin_lock_bh(&host->lock);
++		priv->dma_ops = *host->dma_ops;
++		priv->dma_ops.start = dw_mci_rtd129x_idmac_start;
++		host->dma_ops = &priv->dma_ops;
++		spin_unlock_bh(&host->lock);
++	}
++	if (!cmd23) {
++		mmc->caps &= ~MMC_CAP_CMD23;
++		dev_warn(&pdev->dev, "CMD23 off: multi-block reads end with CMD12\n");
++	}
++	if (pio && host->use_dma != TRANS_MODE_PIO) {
++		/* Before the card scan reaches its first data transfer */
++		host->dma_ops->stop(host);
++		host->use_dma = TRANS_MODE_PIO;
++		dev_warn(&pdev->dev, "PIO mode: the IDMAC is not used\n");
++	}
++	if (!rbus_lock || !bus_sync)
++		dev_warn(&pdev->dev, "debug: rbus_lock=%d bus_sync=%d\n",
++			 rbus_lock, bus_sync);
++
++	priv->ops = *mmc->ops;
++	priv->request = priv->ops.request;
++	priv->ops.request = dw_mci_rtd129x_request;
++	WRITE_ONCE(mmc->ops, &priv->ops);
++
++	if (priv->read_only)
++		dev_warn(&pdev->dev,
++			 "read-only bring-up mode: writes are refused; boot with dw_mmc_rtd129x.allow_writes=1 to allow them\n");
++	else
++		dev_warn(&pdev->dev, "eMMC writes are enabled\n");
++
++	return 0;
++}
++
++/* Bring-up counters: /sys/bus/platform/devices/98012000.mmc/rtd129x_status */
++static ssize_t rtd129x_status_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct dw_mci *host = dev_get_drvdata(dev);
++	struct dw_mci_rtd129x *priv = host->priv;
++
++	return sysfs_emit(buf,
++			  "read_only %d\ncsd_patched %d\nreg_rewrites %u\ndma_done_timeouts %u\npolled_completions %u\nwatchdog_timeouts %u\n"
++			  "irq_entries %u\nirq_cmd_done %u\nirq_data_over %u\nirq_errors %u\nerr_bits %#x\nirq_idmac_ri %u\nirq_idmac_ti %u\nirq_idmac_ais %u\n"
++			  "timer_status_reads %u\nkicks %u\nbusy_reads %u\nown_left %u\nown_fixups %u\npio_fallbacks %u\ndata_reqs %u\ndata_retries %u\ndata_err_timeout %u\ndata_err_crc %u\ndata_err_other %u\ncmd_errs %u\n"
++			  "lat_avg_us %llu\nlat_max_us %u\nmode %s fifoth %s cmd23 %d kick %d watchdog %d own_fix %d\n"
++			  "dma_starts %u\ndma_descs %u\ndma_desc_max %u\ndma_start_errs %u\nvendor_completions %u\ndma_quirks %#x\nboot1_writes %d\nboot1_writes_done %u\n",
++			  priv->read_only, READ_ONCE(priv->csd_patched),
++			  READ_ONCE(priv->rewrites),
++			  READ_ONCE(priv->dma_done_timeouts),
++			  READ_ONCE(priv->polled_completions),
++			  READ_ONCE(priv->watchdog_timeouts),
++			  priv->irq_entries, priv->irq_cmd_done,
++			  priv->irq_data_over, priv->irq_errors, priv->err_bits,
++			  priv->irq_idmac_ri, priv->irq_idmac_ti,
++			  priv->irq_idmac_ais, priv->timer_status_reads,
++			  priv->kicks, priv->busy_reads, priv->own_left,
++			  priv->own_fixups, priv->pio_fallbacks, priv->data_reqs, priv->data_retries,
++			  priv->data_err_timeout, priv->data_err_crc,
++			  priv->data_err_other, priv->cmd_errs,
++			  priv->data_reqs ?
++			  div_u64(priv->lat_sum_us, priv->data_reqs) : 0,
++			  priv->lat_max_us,
++			  host->use_dma == TRANS_MODE_IDMAC ? "idmac" : "pio",
++			  vendor_fifoth ? "vendor" : "dw_mmc", cmd23, kick,
++			  watchdog, own_fix, priv->dma_starts, priv->dma_descs,
++			  priv->dma_desc_max, priv->dma_start_errs,
++			  priv->vendor_completions, dma_quirks, boot1_writes,
++			  priv->boot1_writes_done);
++}
++static DEVICE_ATTR_RO(rtd129x_status);
++
++static struct attribute *dw_mci_rtd129x_attrs[] = {
++	&dev_attr_rtd129x_status.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(dw_mci_rtd129x);
++
++static void dw_mci_rtd129x_remove(struct platform_device *pdev)
++{
++	struct dw_mci *host = platform_get_drvdata(pdev);
++	struct dw_mci_rtd129x *priv = host->priv;
++
++	/*
++	 * The watchdog is not stopped before dw_mci_pltfm_remove(): with the
++	 * vendor completion quirks it is what completes the IDMAC transfers,
++	 * so a request still in flight, or issued while mmc_remove_host()
++	 * runs, would never finish without it. Once the host is removed no
++	 * request is left. Drop the tracked request, so that a run still
++	 * pending returns before any register access, and wait for it.
++	 */
++	dw_mci_pltfm_remove(pdev);
++	WRITE_ONCE(priv->wd_mrq, NULL);
++	cancel_delayed_work_sync(&priv->wd_work);
++}
++
++static const struct of_device_id dw_mci_rtd129x_match[] = {
++	{ .compatible = "realtek,rtd1295-dw-mshc" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, dw_mci_rtd129x_match);
++
++static struct platform_driver dw_mci_rtd129x_driver = {
++	.probe		= dw_mci_rtd129x_probe,
++	.remove		= dw_mci_rtd129x_remove,
++	.driver		= {
++		.name		= "dwmmc_rtd129x",
++		.probe_type	= PROBE_PREFER_ASYNCHRONOUS,
++		.of_match_table	= dw_mci_rtd129x_match,
++		.dev_groups	= dw_mci_rtd129x_groups,
++	},
++};
++module_platform_driver(dw_mci_rtd129x_driver);
++
++MODULE_DESCRIPTION("Realtek RTD129x eMMC host controller glue for dw_mmc");
++MODULE_LICENSE("GPL");

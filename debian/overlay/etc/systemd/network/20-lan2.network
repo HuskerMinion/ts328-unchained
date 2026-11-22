@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Match]
+Name=lan2
+
+[Network]
+DHCP=yes
+
+[DHCPv4]
+ClientIdentifier=mac
+RouteMetric=200

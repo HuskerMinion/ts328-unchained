@@ -1,0 +1,123 @@
+From e6584fad728c8be88d26b218df52bc08645c0c9b Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 22/40] mfd: qnap-mcu: Add the TS-328 variant
+
+The TS-328 MCU uses the same command set as the TS-233/TS-433 one: the
+QTS HAL (libuLinux_hal.so, emcu_sys_*) has the same command table
+("@C0" power off, "@C2"/"@C3" buzzer, "@C4".."@CD" status LED,
+"@CE".."@CG" USB LED, "@Rnm" drive error LEDs, "@FW0"/"@FZ0"/"@FA"
+fan, "@T*" temperature, "%V" version) with an XOR checksum, and opens
+the port at 115200 8N1. The board has three drive bays and a USB LED,
+and its model.conf sets the minimum fan PWM to 50.
+
+Unlike the Rockchip boards, the TS-328 has no PMIC power-off: the MCU
+also switches the SoC supply, and QTS powers off by sending "@C0".
+With no power-off handler registered, the kernel turns a power-off
+request into a halt and never runs the power-off-prepare handler that
+sends the command. So for such variants also register a low-priority
+power-off handler that only waits for the supply to go away.
+---
+ drivers/mfd/qnap-mcu.c       | 40 ++++++++++++++++++++++++++++++++++++
+ include/linux/mfd/qnap-mcu.h |  2 ++
+ 2 files changed, 42 insertions(+)
+
+diff --git a/drivers/mfd/qnap-mcu.c b/drivers/mfd/qnap-mcu.c
+index 22a7a77fd..60061ed20 100644
+--- a/drivers/mfd/qnap-mcu.c
++++ b/drivers/mfd/qnap-mcu.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <linux/cleanup.h>
++#include <linux/delay.h>
+ #include <linux/export.h>
+ #include <linux/mfd/core.h>
+ #include <linux/mfd/qnap-mcu.h>
+@@ -31,6 +32,7 @@
+ #define QNAP_MCU_VERSION_LEN		4
+ 
+ #define QNAP_MCU_TIMEOUT_MS		500
++#define QNAP_MCU_POWER_OFF_WAIT_MS	5000
+ 
+ /**
+  * struct qnap_mcu_reply - Reply to a command
+@@ -248,6 +250,23 @@ static int qnap_mcu_power_off(struct sys_off_data *data)
+ 	return NOTIFY_DONE;
+ }
+ 
++/*
++ * On boards where the MCU also switches the SoC supply there is no other
++ * power-off handler. Without one, the kernel turns a power-off request into
++ * a halt and never runs the power-off-prepare stage above. So register a
++ * handler that only waits for the supply to go away.
++ */
++static int qnap_mcu_power_off_wait(struct sys_off_data *data)
++{
++	struct qnap_mcu *mcu = data->cb_data;
++
++	mdelay(QNAP_MCU_POWER_OFF_WAIT_MS);
++
++	dev_emerg(&mcu->serdev->dev, "MCU did not cut the power\n");
++
++	return NOTIFY_DONE;
++}
++
+ static const struct qnap_mcu_variant qnap_ts233_mcu = {
+ 	.baud_rate = 115200,
+ 	.num_drives = 2,
+@@ -256,6 +275,15 @@ static const struct qnap_mcu_variant qnap_ts233_mcu = {
+ 	.usb_led = true,
+ };
+ 
++static const struct qnap_mcu_variant qnap_ts328_mcu = {
++	.baud_rate = 115200,
++	.num_drives = 3,
++	.fan_pwm_min = 50,  /* Specified in original model.conf */
++	.fan_pwm_max = 255,
++	.usb_led = true,
++	.soc_power = true,
++};
++
+ static const struct qnap_mcu_variant qnap_ts433_mcu = {
+ 	.baud_rate = 115200,
+ 	.num_drives = 4,
+@@ -314,6 +342,17 @@ static int qnap_mcu_probe(struct serdev_device *serdev)
+ 		return dev_err_probe(dev, ret,
+ 				     "Failed to register poweroff handler\n");
+ 
++	if (mcu->variant->soc_power) {
++		ret = devm_register_sys_off_handler(dev,
++						    SYS_OFF_MODE_POWER_OFF,
++						    SYS_OFF_PRIO_LOW,
++						    &qnap_mcu_power_off_wait,
++						    mcu);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "Failed to register poweroff handler\n");
++	}
++
+ 	for (int i = 0; i < ARRAY_SIZE(qnap_mcu_cells); i++) {
+ 		qnap_mcu_cells[i].platform_data = mcu->variant;
+ 		qnap_mcu_cells[i].pdata_size = sizeof(*mcu->variant);
+@@ -329,6 +368,7 @@ static int qnap_mcu_probe(struct serdev_device *serdev)
+ 
+ static const struct of_device_id qnap_mcu_dt_ids[] = {
+ 	{ .compatible = "qnap,ts233-mcu", .data = &qnap_ts233_mcu },
++	{ .compatible = "qnap,ts328-mcu", .data = &qnap_ts328_mcu },
+ 	{ .compatible = "qnap,ts433-mcu", .data = &qnap_ts433_mcu },
+ 	{ /* sentinel */ }
+ };
+diff --git a/include/linux/mfd/qnap-mcu.h b/include/linux/mfd/qnap-mcu.h
+index 42bf523f9..1e69b5271 100644
+--- a/include/linux/mfd/qnap-mcu.h
++++ b/include/linux/mfd/qnap-mcu.h
+@@ -17,6 +17,8 @@ struct qnap_mcu_variant {
+ 	int fan_pwm_min;
+ 	int fan_pwm_max;
+ 	bool usb_led;
++	/* The MCU also switches the SoC supply, no other power-off handler */
++	bool soc_power;
+ };
+ 
+ int qnap_mcu_exec(struct qnap_mcu *mcu,

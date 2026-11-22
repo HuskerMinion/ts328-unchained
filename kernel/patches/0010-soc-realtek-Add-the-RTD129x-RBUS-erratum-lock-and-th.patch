@@ -1,0 +1,1267 @@
+From 176a6dd34d313e167d0c12335e019032280add2a Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 10/40] soc: realtek: Add the RTD129x RBUS erratum lock and the
+ audio CPU RPC
+
+RTD1293/RTD1295/RTD1296 up to revision A01 have a hardware erratum: an
+RBUS register access at offsets 0x800-0x9ff within any 4 KiB block that
+overlaps eMMC controller activity can corrupt the eMMC transfer. The
+Realtek vendor kernels ("rtd129x_lockapi") serialize all such accesses
+and the eMMC command submission with one global spinlock taken with
+interrupts disabled, plus a short NOP settle delay after locking and
+before unlocking.
+
+Add a minimal shared implementation of that lock together with
+readl/writel helpers that only take it for affected addresses, so that
+the PCIe, eMMC and other RBUS drivers can share it. The erratum depends
+only on the low 12 bits of the address, which ioremap() preserves, so
+the helpers test the virtual address directly.
+
+RTD129X_RBUS_LOCK_DEBUG (off by default) records the holder of the
+lock, warns once if the lock is held for more than 1 ms, and reports
+the holder (CPU, caller and hold time) with a stack dump once when a
+CPU has spun on the lock for more than 100 ms.
+
+Also add the transport to the audio CPU (ACPU) firmware, as the Realtek
+vendor kernels implement it (BSP 4.9 common/rpc, QNAP 4.2.8
+rtd129x/rpc; both agree on layout and protocol):
+
+- Initialize the poll/intr/kern ring records at 0x1ffe000 (little
+  endian, ACPU addresses 0xa0000000 | phys; big-endian messages).
+- Ring the doorbell (SB2 0x104 = RPC_INT_SA | WRITE_1) with the vendor
+  notify handshake in vo_int_sync, and announce the SCPU with
+  audio_rpc_flag = 0xffffffff.
+- Kernel RPC to the audio firmware (program 98 on the kern rings), one
+  call at a time, reply matched by task ID, 5 s timeout.
+- Serve the firmware's remote allocation requests (program 98 on the
+  intr rings) from a reserved heap below 512 MiB, replying with the
+  KSEG0 address as BSP 4.9 does.
+- Process the ACPU-to-SCPU rings from the interrupt thread (GIC SPI
+  33), from a waiting caller and from a slow poll (poll_ms, 100 ms by
+  default), so a silent interrupt does not stall anything.
+
+The ACPU is not coherent with the main CPUs, and both sides write the
+ring records and the words of the common area, so both regions must be
+no-map and are mapped write-combined (normal non-cacheable). A write
+then only touches its own word, with no cacheable alias that could
+write back stale neighbors. Explicit barriers order the common area
+accesses: a read is not done ahead of earlier reads, and a write is
+complete before a following doorbell or poll.
+
+The firmware has no failure path for a remote allocation: it turns a 0
+reply into 0x80000000 and takes an exception in RemoteMallocHandler,
+after which no RPC is answered. The heap therefore has to be sized
+generously in the device tree. Track the bytes in use, the peak and the
+block count, show them in sysfs (acpu_heap: "used peak size blocks"),
+and say in the failure message that the firmware will crash.
+---
+ drivers/soc/Kconfig                      |   1 +
+ drivers/soc/Makefile                     |   1 +
+ drivers/soc/realtek/Kconfig              |  41 ++
+ drivers/soc/realtek/Makefile             |   3 +
+ drivers/soc/realtek/rtd1295-rpc.c        | 848 +++++++++++++++++++++++
+ drivers/soc/realtek/rtd129x-lock.c       | 121 ++++
+ include/linux/soc/realtek/rtd1295-rpc.h  |  40 ++
+ include/linux/soc/realtek/rtd129x-lock.h |  80 +++
+ 8 files changed, 1135 insertions(+)
+ create mode 100644 drivers/soc/realtek/Kconfig
+ create mode 100644 drivers/soc/realtek/Makefile
+ create mode 100644 drivers/soc/realtek/rtd1295-rpc.c
+ create mode 100644 drivers/soc/realtek/rtd129x-lock.c
+ create mode 100644 include/linux/soc/realtek/rtd1295-rpc.h
+ create mode 100644 include/linux/soc/realtek/rtd129x-lock.h
+
+diff --git a/drivers/soc/Kconfig b/drivers/soc/Kconfig
+index a2d65adff..d63b9d4dc 100644
+--- a/drivers/soc/Kconfig
++++ b/drivers/soc/Kconfig
+@@ -20,6 +20,7 @@ source "drivers/soc/microchip/Kconfig"
+ source "drivers/soc/nuvoton/Kconfig"
+ source "drivers/soc/pxa/Kconfig"
+ source "drivers/soc/qcom/Kconfig"
++source "drivers/soc/realtek/Kconfig"
+ source "drivers/soc/renesas/Kconfig"
+ source "drivers/soc/rockchip/Kconfig"
+ source "drivers/soc/samsung/Kconfig"
+diff --git a/drivers/soc/Makefile b/drivers/soc/Makefile
+index c9e689080..8678b1001 100644
+--- a/drivers/soc/Makefile
++++ b/drivers/soc/Makefile
+@@ -26,6 +26,7 @@ obj-y				+= nuvoton/
+ obj-y				+= pxa/
+ obj-y				+= amlogic/
+ obj-y				+= qcom/
++obj-y				+= realtek/
+ obj-y				+= renesas/
+ obj-y				+= rockchip/
+ obj-$(CONFIG_SOC_SAMSUNG)	+= samsung/
+diff --git a/drivers/soc/realtek/Kconfig b/drivers/soc/realtek/Kconfig
+new file mode 100644
+index 000000000..67d5a0310
+--- /dev/null
++++ b/drivers/soc/realtek/Kconfig
+@@ -0,0 +1,41 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++menu "Realtek SoC drivers"
++	depends on ARCH_REALTEK || COMPILE_TEST
++
++config RTD129X_RBUS_LOCK
++	bool "Realtek RTD129x eMMC/RBUS erratum serialization"
++	help
++	  RTD1293/RTD1295/RTD1296 SoCs up to revision A01 have a hardware
++	  erratum: an RBUS register access at offsets 0x800-0x9ff within any
++	  4 KiB block that happens while the eMMC controller is active can
++	  corrupt the eMMC transfer. The Realtek vendor kernels serialize
++	  such accesses against eMMC activity with a global lock.
++
++	  This provides that global lock and helpers for drivers that need
++	  it. It is selected by the drivers that use it.
++
++config RTD129X_RBUS_LOCK_DEBUG
++	bool "Debug the RTD129x RBUS erratum lock"
++	depends on RTD129X_RBUS_LOCK
++	help
++	  Record who holds the RTD129x RBUS lock. Warn once when it is held
++	  for more than 1 ms, and report the holder once when a CPU has spun
++	  on it for more than 100 ms (a deadlock or a stalled bus access by
++	  the holder). Costs a clock read per lock/unlock. Say N unless you
++	  are debugging a hang.
++
++config RTD1295_RPC
++	bool "Realtek RTD1295 audio CPU RPC"
++	depends on ARM64
++	depends on ARCH_REALTEK || COMPILE_TEST
++	select GENERIC_ALLOCATOR
++	select MFD_SYSCON
++	help
++	  RPC transport to the audio CPU (ACPU) of the Realtek RTD1293,
++	  RTD1295 and RTD1296. The audio firmware, started by the boot
++	  loader, owns the audio outputs; this provides the shared-memory
++	  rings, the doorbell, and the memory the firmware asks for. It is
++	  needed by the RTD1295 ACPU audio driver.
++
++endmenu
+diff --git a/drivers/soc/realtek/Makefile b/drivers/soc/realtek/Makefile
+new file mode 100644
+index 000000000..0cccb2287
+--- /dev/null
++++ b/drivers/soc/realtek/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_RTD129X_RBUS_LOCK)	+= rtd129x-lock.o
++obj-$(CONFIG_RTD1295_RPC)	+= rtd1295-rpc.o
+diff --git a/drivers/soc/realtek/rtd1295-rpc.c b/drivers/soc/realtek/rtd1295-rpc.c
+new file mode 100644
+index 000000000..c84c31abf
+--- /dev/null
++++ b/drivers/soc/realtek/rtd1295-rpc.c
+@@ -0,0 +1,848 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Realtek RTD1295/RTD1296 RPC to the audio CPU (ACPU)
++ *
++ * The audio CPU runs a firmware ("bluecore.audio") that the boot loader
++ * loads and starts. The main CPUs talk to it through ring buffers at fixed
++ * physical addresses, a doorbell register in SB2, and an interrupt back.
++ * Protocol and layout follow the Realtek vendor kernels (BSP 4.9
++ * drivers/soc/realtek/common/rpc and QNAP 4.2.8
++ * drivers/soc/realtek/rtd129x/rpc), which agree on all of it. The BSP 4.9
++ * RPC driver is
++ * Copyright (c) 2017 Realtek Semiconductor Corp.
++ *
++ * Ring buffer area (phys 0x1ffe000): three families of four 512-byte rings
++ * (S->A audio, A->S audio, S->V video, V->S video) with 64-byte control
++ * records. The records are little endian and hold ACPU addresses
++ * (0xa0000000 | phys, the uncached MIPS window). Messages are big-endian
++ * words: an 8-word header and the parameters.
++ *
++ * This driver serves:
++ *  - kernel RPC (the "kern" family): one call at a time from the audio
++ *    driver, reply matched by task ID;
++ *  - remote allocation requests from the firmware (program 98 on the
++ *    "intr" family), answered from a reserved heap;
++ *  - the doorbell and notify-flag handshake of the vendor driver.
++ *
++ * The A->S direction is processed from the interrupt thread, from a
++ * waiting caller and from a slow poll, so it also works if the firmware
++ * never raises the interrupt.
++ */
++
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/genalloc.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/jiffies.h>
++#include <linux/mfd/syscon.h>
++#include <linux/mm.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++#include <linux/soc/realtek/rtd1295-rpc.h>
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
++/* Ring buffer area */
++#define RPC_RINGBUF_PHYS	0x01ffe000
++#define RPC_RINGBUF_USED	0x1b00
++#define RPC_RING_SIZE		512
++#define RPC_REC_SIZE		64
++#define RPC_NR_RINGS		4
++
++#define RPC_POLL_RING(i)	(0x0000 + (i) * 2 * RPC_RING_SIZE)
++#define RPC_INTR_RING(i)	(0x0200 + (i) * 2 * RPC_RING_SIZE)
++#define RPC_POLL_REC(i)		(0x1000 + (i) * RPC_REC_SIZE)
++#define RPC_INTR_REC(i)		(0x1100 + (i) * RPC_REC_SIZE)
++#define RPC_KERN_RING(i)	(0x1200 + (i) * RPC_RING_SIZE)
++#define RPC_KERN_REC(i)		(0x1a00 + (i) * RPC_REC_SIZE)
++
++#define RING_SA			0	/* SCPU to ACPU */
++#define RING_AS			1	/* ACPU to SCPU */
++
++/* Control record, little endian, ring pointers are ACPU addresses */
++#define REC_RING_BUF		0x00
++#define REC_RING_START		0x04
++#define REC_RING_END		0x08
++#define REC_RING_IN		0x0c
++#define REC_RING_OUT		0x10
++
++/* RPC common area (phys 0x1f000), big-endian words */
++#define RPC_COMM_PHYS		0x0001f000
++#define IPC_AUDIO_RPC_FLAG	0xd0
++#define IPC_VO_INT_SYNC		0x104
++#define IPC_END			0x108
++
++#define RPC_FLAG_READY		0xffffffff
++
++/* vo_int_sync bits */
++#define NOTIFY_SCPU_AUDIO	BIT(8)	/* SCPU wants A->S interrupts */
++#define NOTIFY_SCPU_AUDIO_FB	BIT(9)	/* ACPU raised A->S for audio */
++#define NOTIFY_ACPU_AUDIO	BIT(24)	/* ACPU wants S->A notification */
++#define NOTIFY_ACPU_AUDIO_FB	BIT(25)	/* SCPU rang S->A for audio */
++
++/* SB2 RPC interrupt register */
++#define SB2_RPC_INT		0x104
++#define SB2_RPC_INT_WRITE_1	BIT(0)
++#define SB2_RPC_INT_SA		BIT(1)
++#define SB2_RPC_INT_AS		BIT(3)
++
++/* Message header */
++#define RPC_HDR_WORDS		8
++#define HDR_PROGRAM		0
++#define HDR_VERSION		1
++#define HDR_PROCEDURE		2
++#define HDR_TASK		3
++#define HDR_PARAM_SIZE		6
++#define HDR_CONTEXT		7
++
++#define RPC_PROG_KERNEL		98
++#define RPC_PROG_REMOTE		98	/* R_PROGRAM, on the intr family */
++#define RPC_PROG_REPLY		99
++
++#define RPC_REMOTE_ALLOC	1
++#define RPC_REMOTE_FREE		2
++#define RPC_REMOTE_ALLOC_SECURE	3
++/* The firmware gets remote memory through its cached KSEG0 window */
++#define RPC_ACPU_CACHED_OFFSET	0x80000000
++
++#define RPC_MAX_PARAM_WORDS	16
++#define RPC_CALL_TIMEOUT_MS	5000
++
++static unsigned int poll_ms = 100;
++module_param(poll_ms, uint, 0644);
++MODULE_PARM_DESC(poll_ms, "Poll the ACPU-to-SCPU rings every N ms (0: interrupt only)");
++
++struct rtd1295_rpc_ring {
++	unsigned int rec;	/* record offset in the ring buffer area */
++	unsigned int buf;	/* ring offset in the ring buffer area */
++};
++
++static const struct rtd1295_rpc_ring kern_sa = { RPC_KERN_REC(RING_SA), RPC_KERN_RING(RING_SA) };
++static const struct rtd1295_rpc_ring kern_as = { RPC_KERN_REC(RING_AS), RPC_KERN_RING(RING_AS) };
++static const struct rtd1295_rpc_ring intr_sa = { RPC_INTR_REC(RING_SA), RPC_INTR_RING(RING_SA) };
++static const struct rtd1295_rpc_ring intr_as = { RPC_INTR_REC(RING_AS), RPC_INTR_RING(RING_AS) };
++
++struct rtd1295_rpc_alloc {
++	struct list_head node;
++	phys_addr_t phys;
++	size_t size;
++};
++
++struct rtd1295_rpc {
++	struct device *dev;
++	void *ring;		/* write-combined, ring buffer area */
++	void *comm;		/* write-combined, RPC common area */
++	struct regmap *sb2;
++	int irq;
++
++	spinlock_t tx_lock;	/* S->A rings, doorbell, vo_int_sync */
++	struct mutex rx_lock;	/* A->S rings, call state, heap */
++	struct mutex call_lock;	/* one kernel RPC at a time */
++	wait_queue_head_t wq;
++	u32 next_id;
++	u32 call_id;
++	u32 call_ret;
++	bool call_pending;
++	bool ring_broken;
++
++	struct delayed_work poll;
++
++	struct gen_pool *heap;	/* firmware remote allocations (phys) */
++	void *heap_va;
++	phys_addr_t heap_phys;
++	struct list_head allocs;
++	size_t heap_used;
++	size_t heap_peak;
++	unsigned int heap_blocks;
++};
++
++static u32 rpc_acpu_addr(unsigned int off)
++{
++	return RTD1295_ACPU_UNCACHED(RPC_RINGBUF_PHYS + off);
++}
++
++/* Control records: little endian */
++static u32 rec_read(struct rtd1295_rpc *rpc, unsigned int rec, unsigned int field)
++{
++	return le32_to_cpu(READ_ONCE(*(__le32 *)(rpc->ring + rec + field)));
++}
++
++static void rec_write(struct rtd1295_rpc *rpc, unsigned int rec,
++		      unsigned int field, u32 val)
++{
++	WRITE_ONCE(*(__le32 *)(rpc->ring + rec + field), cpu_to_le32(val));
++}
++
++/*
++ * The common area is shared with the non-coherent ACPU. It is a no-map
++ * region mapped write-combined (normal non-cacheable), so there is no
++ * cacheable alias, every access goes to memory and a write only touches
++ * its own word. The barriers keep the ordering that the cache
++ * maintenance used to give: a read is not done ahead of earlier reads,
++ * and a write is complete before a following doorbell or poll.
++ */
++static u32 comm_read(struct rtd1295_rpc *rpc, unsigned int off)
++{
++	/* not ahead of earlier reads (e.g. of a doorbell or ring) */
++	rmb();
++	return be32_to_cpu(READ_ONCE(*(__be32 *)(rpc->comm + off)));
++}
++
++static void comm_write(struct rtd1295_rpc *rpc, unsigned int off, u32 val)
++{
++	WRITE_ONCE(*(__be32 *)(rpc->comm + off), cpu_to_be32(val));
++	/* in memory before a following doorbell write */
++	wmb();
++}
++
++static void rpc_ring_init(struct rtd1295_rpc *rpc, unsigned int rec,
++			  unsigned int buf)
++{
++	u32 start = rpc_acpu_addr(buf);
++
++	memset(rpc->ring + rec, 0, RPC_REC_SIZE);
++	rec_write(rpc, rec, REC_RING_BUF, start);
++	rec_write(rpc, rec, REC_RING_START, start);
++	rec_write(rpc, rec, REC_RING_END, start + RPC_RING_SIZE);
++	rec_write(rpc, rec, REC_RING_IN, start);
++	rec_write(rpc, rec, REC_RING_OUT, start);
++}
++
++/* Ring offsets of in/out; the firmware could hand us anything */
++static int rpc_ring_ptrs(struct rtd1295_rpc *rpc,
++			 const struct rtd1295_rpc_ring *r, u32 *in, u32 *out)
++{
++	u32 start = rpc_acpu_addr(r->buf);
++
++	*in = rec_read(rpc, r->rec, REC_RING_IN) - start;
++	*out = rec_read(rpc, r->rec, REC_RING_OUT) - start;
++
++	if (*in >= RPC_RING_SIZE || *out >= RPC_RING_SIZE || (*in | *out) & 3) {
++		if (!rpc->ring_broken)
++			dev_err(rpc->dev, "ring %#x: bad pointers in %#x out %#x\n",
++				r->rec, *in + start, *out + start);
++		rpc->ring_broken = true;
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int rpc_ring_write(struct rtd1295_rpc *rpc,
++			  const struct rtd1295_rpc_ring *r,
++			  const __be32 *words, unsigned int n)
++{
++	u32 in, out, used;
++	unsigned int i;
++	int ret;
++
++	lockdep_assert_held(&rpc->tx_lock);
++
++	ret = rpc_ring_ptrs(rpc, r, &in, &out);
++	if (ret)
++		return ret;
++
++	used = (in - out) & (RPC_RING_SIZE - 1);
++	if (n * 4 > RPC_RING_SIZE - used - 1)
++		return -ENOSPC;
++
++	for (i = 0; i < n; i++) {
++		WRITE_ONCE(*(__be32 *)(rpc->ring + r->buf + in), words[i]);
++		in = (in + 4) & (RPC_RING_SIZE - 1);
++	}
++
++	/* Payload before the pointer, as the vendor mb() */
++	mb();
++	rec_write(rpc, r->rec, REC_RING_IN, rpc_acpu_addr(r->buf) + in);
++
++	return 0;
++}
++
++/* Copy n words at word offset skip without consuming them */
++static int rpc_ring_peek(struct rtd1295_rpc *rpc,
++			 const struct rtd1295_rpc_ring *r,
++			 __be32 *words, unsigned int skip, unsigned int n)
++{
++	u32 in, out, used;
++	unsigned int i;
++	int ret;
++
++	ret = rpc_ring_ptrs(rpc, r, &in, &out);
++	if (ret)
++		return ret;
++
++	used = (in - out) & (RPC_RING_SIZE - 1);
++	if ((skip + n) * 4 > used)
++		return -EAGAIN;
++
++	/* The pointer before the payload */
++	rmb();
++	out = (out + skip * 4) & (RPC_RING_SIZE - 1);
++	for (i = 0; i < n; i++) {
++		words[i] = READ_ONCE(*(__be32 *)(rpc->ring + r->buf + out));
++		out = (out + 4) & (RPC_RING_SIZE - 1);
++	}
++
++	return 0;
++}
++
++static void rpc_ring_consume(struct rtd1295_rpc *rpc,
++			     const struct rtd1295_rpc_ring *r, unsigned int n)
++{
++	u32 out = rec_read(rpc, r->rec, REC_RING_OUT) - rpc_acpu_addr(r->buf);
++
++	out = (out + n * 4) & (RPC_RING_SIZE - 1);
++	/* Done reading before the space is handed back */
++	mb();
++	rec_write(rpc, r->rec, REC_RING_OUT, rpc_acpu_addr(r->buf) + out);
++}
++
++/* Drop everything that is in the ring */
++static void rpc_ring_flush(struct rtd1295_rpc *rpc,
++			   const struct rtd1295_rpc_ring *r)
++{
++	/* Order the earlier reads of this ring before the release */
++	mb();
++	rec_write(rpc, r->rec, REC_RING_OUT, rec_read(rpc, r->rec, REC_RING_IN));
++}
++
++/* rpc_send_interrupt() of the vendor driver */
++static void rpc_kick(struct rtd1295_rpc *rpc)
++{
++	u32 sync;
++
++	lockdep_assert_held(&rpc->tx_lock);
++
++	sync = comm_read(rpc, IPC_VO_INT_SYNC);
++	if (sync & NOTIFY_ACPU_AUDIO)
++		comm_write(rpc, IPC_VO_INT_SYNC, sync | NOTIFY_ACPU_AUDIO_FB);
++
++	regmap_write(rpc->sb2, SB2_RPC_INT, SB2_RPC_INT_SA | SB2_RPC_INT_WRITE_1);
++}
++
++static int rpc_send(struct rtd1295_rpc *rpc, const struct rtd1295_rpc_ring *r,
++		    const __be32 *words, unsigned int n)
++{
++	int ret;
++
++	spin_lock(&rpc->tx_lock);
++	ret = rpc_ring_write(rpc, r, words, n);
++	if (!ret)
++		rpc_kick(rpc);
++	spin_unlock(&rpc->tx_lock);
++
++	return ret;
++}
++
++static void rpc_send_reply(struct rtd1295_rpc *rpc,
++			   const struct rtd1295_rpc_ring *r,
++			   const __be32 *req, u32 val)
++{
++	__be32 msg[RPC_HDR_WORDS + 2] = {
++		[HDR_PROGRAM] = cpu_to_be32(RPC_PROG_REPLY),
++		[HDR_VERSION] = cpu_to_be32(RPC_PROG_REPLY),
++		[HDR_PARAM_SIZE] = cpu_to_be32(2 * sizeof(u32)),
++		[HDR_CONTEXT] = req[HDR_CONTEXT] & ~cpu_to_be32(3),
++		[RPC_HDR_WORDS] = req[HDR_TASK],
++		[RPC_HDR_WORDS + 1] = cpu_to_be32(val),
++	};
++	int ret;
++
++	ret = rpc_send(rpc, r, msg, ARRAY_SIZE(msg));
++	if (ret)
++		dev_err(rpc->dev, "cannot send a reply: %d\n", ret);
++}
++
++static phys_addr_t rpc_heap_alloc(struct rtd1295_rpc *rpc, size_t size,
++				  size_t align)
++{
++	struct genpool_data_align data = { .align = align };
++	struct rtd1295_rpc_alloc *a;
++	unsigned long phys;
++
++	if (!rpc->heap)
++		return 0;
++
++	a = kzalloc(sizeof(*a), GFP_KERNEL);
++	if (!a)
++		return 0;
++
++	phys = gen_pool_alloc_algo(rpc->heap, size, gen_pool_first_fit_align,
++				   &data);
++	if (!phys) {
++		kfree(a);
++		return 0;
++	}
++
++	memset(rpc->heap_va + (phys - rpc->heap_phys), 0, size);
++	a->phys = phys;
++	a->size = size;
++	list_add(&a->node, &rpc->allocs);
++	rpc->heap_used += size;
++	rpc->heap_peak = max(rpc->heap_peak, rpc->heap_used);
++	rpc->heap_blocks++;
++
++	return phys;
++}
++
++static void rpc_heap_free(struct rtd1295_rpc *rpc, phys_addr_t phys)
++{
++	struct rtd1295_rpc_alloc *a;
++
++	list_for_each_entry(a, &rpc->allocs, node) {
++		if (a->phys != phys)
++			continue;
++		gen_pool_free(rpc->heap, a->phys, a->size);
++		rpc->heap_used -= a->size;
++		rpc->heap_blocks--;
++		list_del(&a->node);
++		kfree(a);
++		return;
++	}
++
++	dev_warn(rpc->dev, "ACPU frees unknown block %pa\n", &phys);
++}
++
++/* Firmware asks for memory (rpc_ion_handler() in BSP 4.9) */
++static void rpc_handle_remote(struct rtd1295_rpc *rpc, const __be32 *hdr,
++			      const __be32 *param, unsigned int nparam)
++{
++	u32 proc = be32_to_cpu(hdr[HDR_PROCEDURE]);
++	u32 ctx = be32_to_cpu(hdr[HDR_CONTEXT]);
++	u32 arg = nparam ? be32_to_cpu(param[0]) : 0;
++	phys_addr_t phys;
++	size_t size;
++	u32 val = 0;
++
++	switch (proc) {
++	case RPC_REMOTE_ALLOC:
++	case RPC_REMOTE_ALLOC_SECURE:
++		size = PAGE_ALIGN(arg);
++		phys = rpc_heap_alloc(rpc, size, (ctx & 1) ? SZ_4K : SZ_16K);
++		/*
++		 * The firmware does not handle a failure: it turns the 0 into
++		 * 0x80000000 and takes an exception (RemoteMallocHandler).
++		 * So the heap has to be big enough; say loudly if it is not.
++		 */
++		if (phys)
++			val = phys + RPC_ACPU_CACHED_OFFSET;
++		else
++			dev_err(rpc->dev,
++				"ACPU allocation of %zu bytes failed (%zu of %zu KiB in use), the firmware will crash\n",
++				size, rpc->heap_used / SZ_1K,
++				rpc->heap ? gen_pool_size(rpc->heap) / SZ_1K : 0);
++		dev_dbg(rpc->dev, "ACPU alloc %zu bytes -> %08x (%zu KiB in use)\n",
++			size, val, rpc->heap_used / SZ_1K);
++		break;
++	case RPC_REMOTE_FREE:
++		dev_dbg(rpc->dev, "ACPU free %08x\n", arg);
++		rpc_heap_free(rpc, (phys_addr_t)(arg - RPC_ACPU_CACHED_OFFSET));
++		break;
++	default:
++		dev_warn(rpc->dev, "unknown ACPU remote procedure %u\n", proc);
++		break;
++	}
++
++	rpc_send_reply(rpc, &intr_sa, hdr, val);
++}
++
++/* Firmware-initiated messages on the "intr" family */
++static void rpc_process_intr(struct rtd1295_rpc *rpc)
++{
++	__be32 hdr[RPC_HDR_WORDS], param[RPC_MAX_PARAM_WORDS];
++	unsigned int n;
++
++	while (!rpc_ring_peek(rpc, &intr_as, hdr, 0, RPC_HDR_WORDS)) {
++		n = DIV_ROUND_UP(be32_to_cpu(hdr[HDR_PARAM_SIZE]), 4);
++		if (n > RPC_MAX_PARAM_WORDS) {
++			dev_err_ratelimited(rpc->dev,
++				"ACPU message with %u parameter words, dropping the ring\n", n);
++			rpc_ring_flush(rpc, &intr_as);
++			return;
++		}
++		if (rpc_ring_peek(rpc, &intr_as, param, RPC_HDR_WORDS, n))
++			return;	/* not complete yet */
++		rpc_ring_consume(rpc, &intr_as, RPC_HDR_WORDS + n);
++
++		if (be32_to_cpu(hdr[HDR_PROGRAM]) == RPC_PROG_REMOTE) {
++			rpc_handle_remote(rpc, hdr, param, n);
++			continue;
++		}
++
++		dev_info_ratelimited(rpc->dev,
++			"ignoring ACPU request: program %u version %u procedure %u\n",
++			be32_to_cpu(hdr[HDR_PROGRAM]),
++			be32_to_cpu(hdr[HDR_VERSION]),
++			be32_to_cpu(hdr[HDR_PROCEDURE]));
++	}
++}
++
++/* Replies (and rare requests) on the "kern" family */
++static void rpc_process_kern(struct rtd1295_rpc *rpc)
++{
++	__be32 hdr[RPC_HDR_WORDS], param[3];
++	unsigned int n;
++	u32 task;
++
++	while (!rpc_ring_peek(rpc, &kern_as, hdr, 0, RPC_HDR_WORDS)) {
++		/* Fixed sizes, as the vendor reader: request 3, reply 2 */
++		task = be32_to_cpu(hdr[HDR_TASK]);
++		n = task ? 3 : 2;
++		if (rpc_ring_peek(rpc, &kern_as, param, RPC_HDR_WORDS, n))
++			return;
++		rpc_ring_consume(rpc, &kern_as, RPC_HDR_WORDS + n);
++
++		if (task) {
++			dev_dbg(rpc->dev, "ACPU kernel request %#x (%#x, %#x)\n",
++				be32_to_cpu(param[0]), be32_to_cpu(param[1]),
++				be32_to_cpu(param[2]));
++			/* No handlers, the vendor answers 0 as well */
++			rpc_send_reply(rpc, &kern_sa, hdr, 0);
++			continue;
++		}
++
++		if (rpc->call_pending && be32_to_cpu(param[0]) == rpc->call_id) {
++			rpc->call_ret = be32_to_cpu(param[1]);
++			rpc->call_pending = false;
++			wake_up(&rpc->wq);
++		} else {
++			dev_warn_ratelimited(rpc->dev, "stray reply for task %u\n",
++					     be32_to_cpu(param[0]));
++		}
++	}
++}
++
++static void rpc_process(struct rtd1295_rpc *rpc)
++{
++	mutex_lock(&rpc->rx_lock);
++	rpc_process_intr(rpc);
++	rpc_process_kern(rpc);
++	mutex_unlock(&rpc->rx_lock);
++}
++
++int rtd1295_rpc_audio_call(struct rtd1295_rpc *rpc, u32 cmd, u32 arg, u32 res,
++			   u32 *ret)
++{
++	unsigned long deadline;
++	__be32 msg[RPC_HDR_WORDS + 3];
++	bool pending;
++	int err;
++	u32 id;
++
++	mutex_lock(&rpc->call_lock);
++
++	mutex_lock(&rpc->rx_lock);
++	id = ++rpc->next_id;
++	if (!id)
++		id = ++rpc->next_id;
++	rpc->call_id = id;
++	rpc->call_pending = true;
++	mutex_unlock(&rpc->rx_lock);
++
++	memset(msg, 0, sizeof(msg));
++	msg[HDR_PROGRAM] = cpu_to_be32(RPC_PROG_KERNEL);
++	msg[HDR_VERSION] = cpu_to_be32(RPC_PROG_KERNEL);
++	msg[HDR_TASK] = cpu_to_be32(id);
++	msg[HDR_PARAM_SIZE] = cpu_to_be32(3 * sizeof(u32));
++	msg[RPC_HDR_WORDS] = cpu_to_be32(cmd);
++	msg[RPC_HDR_WORDS + 1] = cpu_to_be32(arg);
++	msg[RPC_HDR_WORDS + 2] = cpu_to_be32(res);
++
++	err = rpc_send(rpc, &kern_sa, msg, ARRAY_SIZE(msg));
++	if (err)
++		goto out;
++
++	deadline = jiffies + msecs_to_jiffies(RPC_CALL_TIMEOUT_MS);
++	for (;;) {
++		rpc_process(rpc);
++
++		mutex_lock(&rpc->rx_lock);
++		pending = rpc->call_pending;
++		mutex_unlock(&rpc->rx_lock);
++		if (!pending)
++			break;
++
++		if (time_after(jiffies, deadline)) {
++			dev_err(rpc->dev, "no reply to command %u (task %u)\n",
++				cmd, id);
++			err = -ETIMEDOUT;
++			goto out;
++		}
++
++		wait_event_timeout(rpc->wq, !READ_ONCE(rpc->call_pending),
++				   msecs_to_jiffies(2));
++	}
++
++	*ret = rpc->call_ret;
++	dev_dbg(rpc->dev, "command %u -> %#x\n", cmd, *ret);
++out:
++	mutex_lock(&rpc->rx_lock);
++	rpc->call_pending = false;
++	mutex_unlock(&rpc->rx_lock);
++	mutex_unlock(&rpc->call_lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(rtd1295_rpc_audio_call);
++
++/* "used peak size blocks" of the firmware heap, in bytes */
++static ssize_t acpu_heap_show(struct device *dev, struct device_attribute *attr,
++			      char *buf)
++{
++	struct rtd1295_rpc *rpc = dev_get_drvdata(dev);
++	ssize_t len;
++
++	if (!rpc)
++		return -ENODEV;
++
++	mutex_lock(&rpc->rx_lock);
++	len = sysfs_emit(buf, "%zu %zu %zu %u\n", rpc->heap_used,
++			 rpc->heap_peak,
++			 rpc->heap ? gen_pool_size(rpc->heap) : 0,
++			 rpc->heap_blocks);
++	mutex_unlock(&rpc->rx_lock);
++
++	return len;
++}
++static DEVICE_ATTR_RO(acpu_heap);
++
++static struct attribute *rtd1295_rpc_attrs[] = {
++	&dev_attr_acpu_heap.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(rtd1295_rpc);
++
++static void rtd1295_rpc_put(void *data)
++{
++	put_device(data);
++}
++
++struct rtd1295_rpc *rtd1295_rpc_get(struct device *dev)
++{
++	struct platform_device *pdev;
++	struct device_node *np;
++	struct rtd1295_rpc *rpc;
++	int ret;
++
++	np = of_parse_phandle(dev->of_node, "realtek,rpc", 0);
++	if (!np)
++		return ERR_PTR(-ENODEV);
++
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev)
++		return ERR_PTR(-EPROBE_DEFER);
++
++	ret = devm_add_action_or_reset(dev, rtd1295_rpc_put, &pdev->dev);
++	if (ret)
++		return ERR_PTR(ret);
++
++	rpc = platform_get_drvdata(pdev);
++	if (!rpc)
++		return ERR_PTR(-EPROBE_DEFER);
++
++	return rpc;
++}
++EXPORT_SYMBOL_GPL(rtd1295_rpc_get);
++
++static irqreturn_t rtd1295_rpc_irq(int irq, void *data)
++{
++	struct rtd1295_rpc *rpc = data;
++	unsigned int val;
++
++	if (regmap_read(rpc->sb2, SB2_RPC_INT, &val) || !(val & SB2_RPC_INT_AS))
++		return IRQ_NONE;
++
++	/* Data bit 0: clears A->S */
++	regmap_write(rpc->sb2, SB2_RPC_INT, SB2_RPC_INT_AS);
++
++	return IRQ_WAKE_THREAD;
++}
++
++static irqreturn_t rtd1295_rpc_irq_thread(int irq, void *data)
++{
++	struct rtd1295_rpc *rpc = data;
++	u32 sync;
++
++	spin_lock(&rpc->tx_lock);
++	sync = comm_read(rpc, IPC_VO_INT_SYNC);
++	if (sync & NOTIFY_SCPU_AUDIO_FB)
++		comm_write(rpc, IPC_VO_INT_SYNC, sync & ~NOTIFY_SCPU_AUDIO_FB);
++	spin_unlock(&rpc->tx_lock);
++
++	rpc_process(rpc);
++
++	return IRQ_HANDLED;
++}
++
++static void rtd1295_rpc_poll(struct work_struct *work)
++{
++	struct rtd1295_rpc *rpc = container_of(to_delayed_work(work),
++					       struct rtd1295_rpc, poll);
++	unsigned int ms = READ_ONCE(poll_ms);
++
++	rpc_process(rpc);
++
++	if (ms)
++		schedule_delayed_work(&rpc->poll, msecs_to_jiffies(ms));
++}
++
++static int rtd1295_rpc_map(struct rtd1295_rpc *rpc, unsigned int idx,
++			   phys_addr_t expect, size_t min, unsigned long flags,
++			   void **va, struct resource *res)
++{
++	struct device *dev = rpc->dev;
++	int ret;
++
++	ret = of_reserved_mem_region_to_resource(dev->of_node, idx, res);
++	if (ret)
++		return ret;
++
++	if ((expect && res->start != expect) || resource_size(res) < min)
++		return dev_err_probe(dev, -EINVAL, "memory-region %u: bad %pR\n",
++				     idx, res);
++
++	*va = devm_memremap(dev, res->start, resource_size(res), flags);
++	if (IS_ERR(*va))
++		return dev_err_probe(dev, PTR_ERR(*va),
++				     "cannot map memory-region %u %pR (no-map?)\n",
++				     idx, res);
++
++	return 0;
++}
++
++static int rtd1295_rpc_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct rtd1295_rpc *rpc;
++	struct resource res;
++	unsigned int i;
++	u32 sync;
++	int ret;
++
++	rpc = devm_kzalloc(dev, sizeof(*rpc), GFP_KERNEL);
++	if (!rpc)
++		return -ENOMEM;
++	rpc->dev = dev;
++	spin_lock_init(&rpc->tx_lock);
++	mutex_init(&rpc->rx_lock);
++	mutex_init(&rpc->call_lock);
++	init_waitqueue_head(&rpc->wq);
++	INIT_LIST_HEAD(&rpc->allocs);
++	INIT_DELAYED_WORK(&rpc->poll, rtd1295_rpc_poll);
++
++	/* The ring area must not be cacheable: both CPUs write each record */
++	ret = rtd1295_rpc_map(rpc, 0, RPC_RINGBUF_PHYS, RPC_RINGBUF_USED,
++			      MEMREMAP_WC, &rpc->ring, &res);
++	if (ret)
++		return ret;
++
++	/* Also written by both CPUs, word by word: not cacheable either */
++	ret = rtd1295_rpc_map(rpc, 1, RPC_COMM_PHYS, IPC_END, MEMREMAP_WC,
++			      &rpc->comm, &res);
++	if (ret)
++		return ret;
++
++	/* Optional heap for the firmware's own allocations */
++	if (!rtd1295_rpc_map(rpc, 2, 0, SZ_64K, MEMREMAP_WC, &rpc->heap_va,
++			     &res)) {
++		if (res.end >= RTD1295_ACPU_DMA_LIMIT)
++			return dev_err_probe(dev, -EINVAL,
++					     "ACPU heap %pR above 512 MiB\n", &res);
++		rpc->heap_phys = res.start;
++		rpc->heap = devm_gen_pool_create(dev, PAGE_SHIFT, -1, "acpu");
++		if (IS_ERR(rpc->heap))
++			return PTR_ERR(rpc->heap);
++		ret = gen_pool_add(rpc->heap, res.start, resource_size(&res), -1);
++		if (ret)
++			return ret;
++	} else {
++		dev_warn(dev, "no ACPU heap, firmware allocations will fail\n");
++	}
++
++	rpc->sb2 = syscon_regmap_lookup_by_phandle(dev->of_node, "realtek,sb2");
++	if (IS_ERR(rpc->sb2))
++		return dev_err_probe(dev, PTR_ERR(rpc->sb2), "no SB2 syscon\n");
++
++	dev_info(dev, "before init: audio RPC flag %08x, notify %08x\n",
++		 comm_read(rpc, IPC_AUDIO_RPC_FLAG),
++		 comm_read(rpc, IPC_VO_INT_SYNC));
++
++	for (i = 0; i < RPC_NR_RINGS; i++) {
++		rpc_ring_init(rpc, RPC_POLL_REC(i), RPC_POLL_RING(i));
++		rpc_ring_init(rpc, RPC_INTR_REC(i), RPC_INTR_RING(i));
++		rpc_ring_init(rpc, RPC_KERN_REC(i), RPC_KERN_RING(i));
++	}
++	/* Records in memory before the doorbell below */
++	wmb();
++
++	rpc->irq = platform_get_irq_optional(pdev, 0);
++	if (rpc->irq > 0) {
++		spin_lock(&rpc->tx_lock);
++		sync = comm_read(rpc, IPC_VO_INT_SYNC);
++		comm_write(rpc, IPC_VO_INT_SYNC, sync | NOTIFY_SCPU_AUDIO);
++		spin_unlock(&rpc->tx_lock);
++
++		ret = devm_request_threaded_irq(dev, rpc->irq, rtd1295_rpc_irq,
++						rtd1295_rpc_irq_thread,
++						IRQF_ONESHOT, dev_name(dev), rpc);
++		if (ret)
++			return dev_err_probe(dev, ret, "cannot request IRQ\n");
++	} else if (rpc->irq == -EPROBE_DEFER) {
++		return rpc->irq;
++	}
++
++	spin_lock(&rpc->tx_lock);
++	rpc_kick(rpc);
++	spin_unlock(&rpc->tx_lock);
++	comm_write(rpc, IPC_AUDIO_RPC_FLAG, RPC_FLAG_READY);
++
++	platform_set_drvdata(pdev, rpc);
++
++	if (poll_ms)
++		schedule_delayed_work(&rpc->poll, msecs_to_jiffies(poll_ms));
++
++	dev_info(dev, "ACPU RPC up: notify %08x, irq %d, heap %zu KiB\n",
++		 comm_read(rpc, IPC_VO_INT_SYNC), rpc->irq > 0 ? rpc->irq : 0,
++		 rpc->heap ? gen_pool_size(rpc->heap) / SZ_1K : 0);
++
++	return 0;
++}
++
++static void rtd1295_rpc_shutdown(struct platform_device *pdev)
++{
++	struct rtd1295_rpc *rpc = platform_get_drvdata(pdev);
++
++	if (!rpc)
++		return;
++
++	WRITE_ONCE(poll_ms, 0);
++	cancel_delayed_work_sync(&rpc->poll);
++	if (rpc->irq > 0)
++		disable_irq(rpc->irq);
++}
++
++static const struct of_device_id rtd1295_rpc_of_match[] = {
++	{ .compatible = "realtek,rtd1295-rpc" },
++	{ /* sentinel */ }
++};
++
++static struct platform_driver rtd1295_rpc_driver = {
++	.probe = rtd1295_rpc_probe,
++	.shutdown = rtd1295_rpc_shutdown,
++	.driver = {
++		.name = "rtd1295-rpc",
++		.of_match_table = rtd1295_rpc_of_match,
++		.dev_groups = rtd1295_rpc_groups,
++		.suppress_bind_attrs = true,
++	},
++};
++builtin_platform_driver(rtd1295_rpc_driver);
+diff --git a/drivers/soc/realtek/rtd129x-lock.c b/drivers/soc/realtek/rtd129x-lock.c
+new file mode 100644
+index 000000000..779e3efb8
+--- /dev/null
++++ b/drivers/soc/realtek/rtd129x-lock.c
+@@ -0,0 +1,121 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Realtek RTD129x eMMC/RBUS erratum serialization
++ *
++ * Based on the "rtd129x_lockapi" of the Realtek vendor kernels (QNAP 4.2.8,
++ * Synology 4.4, Realtek BSP 4.9): one global spinlock, taken with IRQs off,
++ * plus a short settle delay after taking and before releasing it. The
++ * Realtek BSP 4.9 rtd129x_lockapi.c is
++ * Copyright (c) 2017 Realtek Semiconductor Corp.
++ */
++
++#include <linux/export.h>
++#include <linux/irqflags.h>
++#include <linux/math64.h>
++#include <linux/printk.h>
++#include <linux/sched/clock.h>
++#include <linux/soc/realtek/rtd129x-lock.h>
++#include <linux/spinlock.h>
++
++/* The vendor code spins 30 NOPs after locking and before unlocking. */
++#define RTD129X_RBUS_SETTLE_NOPS	30
++
++static DEFINE_RAW_SPINLOCK(rtd129x_rbus_spinlock);
++
++#ifdef CONFIG_RTD129X_RBUS_LOCK_DEBUG
++#define RTD129X_RBUS_HOLD_WARN_NS	(1 * NSEC_PER_MSEC)
++#define RTD129X_RBUS_SPIN_WARN_NS	(100 * NSEC_PER_MSEC)
++
++/* Written by the holder only; read racily by spinning CPUs for reports */
++static unsigned long rtd129x_rbus_owner_ip;
++static int rtd129x_rbus_owner_cpu = -1;
++static u64 rtd129x_rbus_owner_since;
++
++static void rtd129x_rbus_debug_acquire(unsigned long ip)
++{
++	u64 start = local_clock();
++	bool reported = false;
++
++	while (!raw_spin_trylock(&rtd129x_rbus_spinlock)) {
++		do {
++			cpu_relax();
++			if (!reported &&
++			    local_clock() - start > RTD129X_RBUS_SPIN_WARN_NS) {
++				reported = true;
++				pr_err("rtd129x rbus lock: CPU%d (%pS) spinning for >100 ms; held by CPU%d at %pS for %llu us\n",
++				       raw_smp_processor_id(), (void *)ip,
++				       READ_ONCE(rtd129x_rbus_owner_cpu),
++				       (void *)READ_ONCE(rtd129x_rbus_owner_ip),
++				       div_u64(local_clock() -
++					       READ_ONCE(rtd129x_rbus_owner_since),
++					       NSEC_PER_USEC));
++				dump_stack();
++			}
++		} while (raw_spin_is_locked(&rtd129x_rbus_spinlock));
++	}
++
++	WRITE_ONCE(rtd129x_rbus_owner_ip, ip);
++	WRITE_ONCE(rtd129x_rbus_owner_cpu, raw_smp_processor_id());
++	WRITE_ONCE(rtd129x_rbus_owner_since, local_clock());
++}
++
++static void rtd129x_rbus_debug_release(void)
++{
++	u64 held = local_clock() - rtd129x_rbus_owner_since;
++	unsigned long ip = rtd129x_rbus_owner_ip;
++
++	WRITE_ONCE(rtd129x_rbus_owner_cpu, -1);
++	raw_spin_unlock(&rtd129x_rbus_spinlock);
++
++	WARN_ONCE(held > RTD129X_RBUS_HOLD_WARN_NS,
++		  "rtd129x rbus lock held for %llu us by %pS\n",
++		  div_u64(held, NSEC_PER_USEC), (void *)ip);
++}
++#endif
++
++static __always_inline void rtd129x_rbus_settle(void)
++{
++	unsigned int i;
++
++	for (i = 0; i < RTD129X_RBUS_SETTLE_NOPS; i++)
++		asm volatile("nop");
++}
++
++/**
++ * rtd129x_rbus_lock() - serialize against the RTD129x eMMC erratum
++ *
++ * Disables local interrupts and takes the global RTD129x RBUS lock.
++ *
++ * Return: the saved interrupt flags to pass to rtd129x_rbus_unlock().
++ */
++unsigned long rtd129x_rbus_lock(void)
++{
++	unsigned long flags;
++
++#ifdef CONFIG_RTD129X_RBUS_LOCK_DEBUG
++	local_irq_save(flags);
++	rtd129x_rbus_debug_acquire(_RET_IP_);
++#else
++	raw_spin_lock_irqsave(&rtd129x_rbus_spinlock, flags);
++#endif
++	rtd129x_rbus_settle();
++
++	return flags;
++}
++EXPORT_SYMBOL_GPL(rtd129x_rbus_lock);
++
++/**
++ * rtd129x_rbus_unlock() - release the global RTD129x RBUS lock
++ * @flags: the value returned by rtd129x_rbus_lock()
++ */
++void rtd129x_rbus_unlock(unsigned long flags)
++{
++	rtd129x_rbus_settle();
++#ifdef CONFIG_RTD129X_RBUS_LOCK_DEBUG
++	rtd129x_rbus_debug_release();
++	local_irq_restore(flags);
++#else
++	raw_spin_unlock_irqrestore(&rtd129x_rbus_spinlock, flags);
++#endif
++}
++EXPORT_SYMBOL_GPL(rtd129x_rbus_unlock);
+diff --git a/include/linux/soc/realtek/rtd1295-rpc.h b/include/linux/soc/realtek/rtd1295-rpc.h
+new file mode 100644
+index 000000000..def92e042
+--- /dev/null
++++ b/include/linux/soc/realtek/rtd1295-rpc.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Realtek RTD1295/RTD1296 RPC to the audio CPU (ACPU)
++ */
++
++#ifndef __LINUX_SOC_REALTEK_RTD1295_RPC_H
++#define __LINUX_SOC_REALTEK_RTD1295_RPC_H
++
++#include <linux/types.h>
++
++struct device;
++struct rtd1295_rpc;
++
++/* The ACPU sees the first 512 MiB through its uncached KSEG1 window */
++#define RTD1295_ACPU_DMA_LIMIT		0x20000000
++#define RTD1295_ACPU_UNCACHED(phys)	((u32)(phys) | 0xa0000000)
++
++/* Firmware HRESULT for success */
++#define RTD1295_ACPU_S_OK		0x10000000
++
++/*
++ * rtd1295_rpc_get - look up the RPC core from a consumer's "realtek,rpc"
++ * phandle. Returns -EPROBE_DEFER until the core has probed. The reference
++ * is device managed.
++ */
++struct rtd1295_rpc *rtd1295_rpc_get(struct device *dev);
++
++/*
++ * rtd1295_rpc_audio_call - one kernel RPC to the audio firmware
++ * @cmd:	firmware command (ENUM_KERNEL_RPC_*)
++ * @arg:	ACPU address of the argument structure
++ * @res:	ACPU address of the result structure
++ * @ret:	the firmware's return value (CPU endian)
++ *
++ * Sleeps until the firmware replies or a timeout. Calls are serialized.
++ */
++int rtd1295_rpc_audio_call(struct rtd1295_rpc *rpc, u32 cmd, u32 arg, u32 res,
++			   u32 *ret);
++
++#endif
+diff --git a/include/linux/soc/realtek/rtd129x-lock.h b/include/linux/soc/realtek/rtd129x-lock.h
+new file mode 100644
+index 000000000..c275c0e14
+--- /dev/null
++++ b/include/linux/soc/realtek/rtd129x-lock.h
+@@ -0,0 +1,80 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Realtek RTD129x eMMC/RBUS erratum serialization
++ *
++ * On RTD1293/RTD1295/RTD1296 up to revision A01, an RBUS register access
++ * at offsets 0x800-0x9ff within any 4 KiB block that overlaps eMMC
++ * controller activity can corrupt the eMMC transfer. The vendor kernels
++ * ("rtd129x_lockapi") serialize all such accesses and the eMMC command
++ * submission with one global spinlock that is taken with IRQs off.
++ *
++ * Drivers for RBUS blocks wrap accesses in the affected range with
++ * rtd129x_rbus_lock()/rtd129x_rbus_unlock(), or use the rtd129x_rbus_*()
++ * accessors below, which only take the lock when the address is affected.
++ * The eMMC driver holds the lock around its own critical sequence.
++ */
++#ifndef __LINUX_SOC_REALTEK_RTD129X_LOCK_H
++#define __LINUX_SOC_REALTEK_RTD129X_LOCK_H
++
++#include <linux/io.h>
++#include <linux/types.h>
++
++#define RTD129X_RBUS_LOCK_START		0x800
++#define RTD129X_RBUS_LOCK_END		0xa00	/* exclusive */
++
++/*
++ * The erratum depends on the low 12 bits of the physical address. ioremap()
++ * keeps the offset within a page and pages are at least 4 KiB, so the
++ * virtual address can be tested directly.
++ */
++static inline bool rtd129x_rbus_addr_affected(const void __iomem *addr)
++{
++	unsigned long off = (unsigned long)addr & 0xfff;
++
++	return off >= RTD129X_RBUS_LOCK_START && off < RTD129X_RBUS_LOCK_END;
++}
++
++#if IS_ENABLED(CONFIG_RTD129X_RBUS_LOCK)
++unsigned long rtd129x_rbus_lock(void);
++void rtd129x_rbus_unlock(unsigned long flags);
++#else
++static inline unsigned long rtd129x_rbus_lock(void)
++{
++	return 0;
++}
++
++static inline void rtd129x_rbus_unlock(unsigned long flags)
++{
++}
++#endif
++
++static inline u32 rtd129x_rbus_readl(const void __iomem *addr)
++{
++	unsigned long flags;
++	u32 val;
++
++	if (!rtd129x_rbus_addr_affected(addr))
++		return readl(addr);
++
++	flags = rtd129x_rbus_lock();
++	val = readl(addr);
++	rtd129x_rbus_unlock(flags);
++
++	return val;
++}
++
++static inline void rtd129x_rbus_writel(u32 val, void __iomem *addr)
++{
++	unsigned long flags;
++
++	if (!rtd129x_rbus_addr_affected(addr)) {
++		writel(val, addr);
++		return;
++	}
++
++	flags = rtd129x_rbus_lock();
++	writel(val, addr);
++	rtd129x_rbus_unlock(flags);
++}
++
++#endif /* __LINUX_SOC_REALTEK_RTD129X_LOCK_H */

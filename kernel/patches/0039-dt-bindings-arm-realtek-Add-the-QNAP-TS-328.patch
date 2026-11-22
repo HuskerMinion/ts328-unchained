@@ -1,0 +1,22 @@
+From 243b7ed9a4808cd55e96c9b603bf50e3e8ee85bc Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 39/40] dt-bindings: arm: realtek: Add the QNAP TS-328
+
+Add the QNAP TS-328 NAS, which is based on the Realtek RTD1296 SoC.
+---
+ Documentation/devicetree/bindings/arm/realtek.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Documentation/devicetree/bindings/arm/realtek.yaml b/Documentation/devicetree/bindings/arm/realtek.yaml
+index ddd9a8509..a1de241a3 100644
+--- a/Documentation/devicetree/bindings/arm/realtek.yaml
++++ b/Documentation/devicetree/bindings/arm/realtek.yaml
+@@ -39,6 +39,7 @@ properties:
+       # RTD1296 SoC based boards
+       - items:
+           - enum:
++              - qnap,ts-328 # QNAP TS-328
+               - synology,ds418 # Synology DiskStation DS418
+           - const: realtek,rtd1296
+ 

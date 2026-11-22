@@ -1,0 +1,653 @@
+From 396484c874a0b7aff6aff8c2a719f995cfb79dae Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 38/40] arm64: dts: realtek: rtd129x: Describe the SoC
+ peripherals
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Describe the RTD129x peripherals that now have drivers:
+
+- The ISO and MISC IRQ muxes (GIC SPI 41 and 40, as in the vendor DT),
+  with the UART interrupts routed through them so that the UARTs no
+  longer have to be polled. This follows the corresponding patch in
+  Andreas Färber's IRQ mux series.
+- The ISO (35 lines) and MISC (101 lines) GPIO controllers, with their
+  interrupts from the muxes and the interrupt status offsets of the
+  Realtek 4.9 BSP. gpio-ranges is left out until there is a pinctrl
+  driver.
+- The six DesignWare I2C controllers and the SoC RTC, with addresses
+  and IRQ mux bits from the Realtek 4.9 BSP DT and Andreas Färber's
+  rtd1295-next tree. There is no clock driver yet; these blocks run
+  from the 27 MHz oscillator behind enable gates, so they reference
+  osc27M directly and rely on the boot loader having enabled the gates.
+- The two PCIe root complexes and the SB4 syscon, and #address-cells on
+  the GIC node for interrupt-map users.
+- The DWC3 USB controllers with their Realtek USB2/USB3 PHYs: the DRD
+  controller, the USB 2.0 host and, on RTD1296 only, the USB 3.0 host,
+  all on GIC SPI 21. Every controller lists the CRT resets of all ports
+  and the common USB clock gate, because the vendor bring-up releases
+  all PHY resets before the MDIO and common resets.
+- The GMAC (GIC SPI 22) with its ISO resets and the ISO syscon.
+- The ISO PWM controller, the CPU thermal sensor and a CPU thermal zone
+  with the trip points of the QNAP vendor kernel: passive at 115 degC
+  and critical at 130 degC. Boards add the cooling maps.
+- The eMMC controller (GIC SPI 42) with the CRT and SB2 syscons. The
+  FIFO depth of 128 words follows the vendor FIFOTH value (TX
+  watermark 127), so the driver does not take it from the FIFOTH value
+  the boot loader left.
+- The audio CPU RPC and power-off nodes. The RPC ring area and the RPC
+  common area become no-map regions: both the main CPUs and the
+  non-coherent audio CPU write them, so they must not be cacheable.
+- The AHCI controller (SPI 28) and its PHY MDIO bridge, split off the
+  end of the wrapper (0x9803ff60), with the MAC and PHY resets of the
+  vendor DT.
+- The SCPU PLL in CRT. The OPPs, the CPU supply and the cooling maps
+  are left to the boards: without the CPU supply, cpufreq-dt would
+  raise the clock without the voltage.
+
+Addresses, interrupts and resets come from the Realtek and QNAP vendor
+DTs. Everything that depends on board wiring or on the audio firmware
+started by the boot loader is disabled by default.
+---
+ arch/arm64/boot/dts/realtek/rtd1296.dtsi |  46 +++
+ arch/arm64/boot/dts/realtek/rtd129x.dtsi | 443 +++++++++++++++++++++++
+ 2 files changed, 489 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/realtek/rtd1296.dtsi b/arch/arm64/boot/dts/realtek/rtd1296.dtsi
+index 4f805f576..847257429 100644
+--- a/arch/arm64/boot/dts/realtek/rtd1296.dtsi
++++ b/arch/arm64/boot/dts/realtek/rtd1296.dtsi
+@@ -65,3 +65,49 @@ timer {
+ &arm_pmu {
+ 	interrupt-affinity = <&cpu0>, <&cpu1>, <&cpu2>, <&cpu3>;
+ };
++
++&rbus {
++	/* USB 3.0 host, RTD1296 only; also on interrupt SPI 21 */
++	usb_u3host: usb@13e00 {
++		compatible = "realtek,rtd1295-dwc3", "realtek,rtd-dwc3";
++		reg = <0x13e00 0x200>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++		resets = <&reset1 RTD1295_RSTN_USB_PHY0>,
++			 <&reset1 RTD1295_RSTN_USB_PHY1>,
++			 <&reset2 RTD1295_RSTN_USB_PHY2>,
++			 <&reset2 RTD1295_RSTN_USB_PHY3>,
++			 <&reset1 RTD1295_RSTN_USB3_PHY0_POW>,
++			 <&reset2 RTD1295_RSTN_USB3_PHY1_POW>,
++			 <&reset1 RTD1295_RSTN_USB3_P0_MDIO>,
++			 <&reset2 RTD1295_RSTN_USB3_P1_MDIO>,
++			 <&reset1 RTD1295_RSTN_USB>;
++		realtek,usb-clock = <&crt 0x0c 4 6>;
++		status = "disabled";
++
++		usb@1f0000 {
++			compatible = "snps,dwc3";
++			reg = <0x1f0000 0x9000>;
++			interrupts = <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH>;
++			phys = <&usb2phy_u3host>, <&usb3phy_u3host>;
++			phy-names = "usb2-phy", "usb3-phy";
++			dr_mode = "host";
++			snps,dis_u2_susphy_quirk;
++		};
++	};
++
++	usb3phy_u3host: usb-phy@13e10 {
++		compatible = "realtek,rtd1295-usb3phy";
++		reg = <0x13e10 0x4>;
++		#phy-cells = <0>;
++		status = "disabled";
++	};
++
++	usb2phy_u3host: usb-phy@13e14 {
++		compatible = "realtek,rtd1295-usb2phy";
++		reg = <0x13e14 0x4>, <0x1f8280 0x4>;
++		#phy-cells = <0>;
++		status = "disabled";
++	};
++};
+diff --git a/arch/arm64/boot/dts/realtek/rtd129x.dtsi b/arch/arm64/boot/dts/realtek/rtd129x.dtsi
+index ba50e292b..74e76a53a 100644
+--- a/arch/arm64/boot/dts/realtek/rtd129x.dtsi
++++ b/arch/arm64/boot/dts/realtek/rtd129x.dtsi
+@@ -22,12 +22,19 @@ reserved-memory {
+ 		#size-cells = <1>;
+ 		ranges;
+ 
++		/*
++		 * Shared with the non-coherent audio CPU, which writes words
++		 * next to the ones the main CPUs write: must not be cacheable
++		 */
+ 		rpc_comm: rpc@1f000 {
+ 			reg = <0x1f000 0x1000>;
++			no-map;
+ 		};
+ 
++		/* Both CPUs write the ring records: must not be cacheable */
+ 		rpc_ringbuf: rpc@1ffe000 {
+ 			reg = <0x1ffe000 0x4000>;
++			no-map;
+ 		};
+ 
+ 		tee: tee@10100000 {
+@@ -36,11 +43,34 @@ tee: tee@10100000 {
+ 		};
+ 	};
+ 
++	/* Needs the audio CPU firmware, which the boot loader starts */
++	acpu_poweroff: poweroff {
++		compatible = "realtek,rtd1295-acpu-poweroff";
++		memory-region = <&rpc_comm>;
++		realtek,sb2 = <&sb2>;
++		status = "disabled";
++	};
++
++	/* RPC to the audio CPU firmware, which the boot loader starts */
++	acpu_rpc: rpc {
++		compatible = "realtek,rtd1295-rpc";
++		memory-region = <&rpc_ringbuf>, <&rpc_comm>;
++		interrupts = <GIC_SPI 33 IRQ_TYPE_LEVEL_HIGH>;
++		realtek,sb2 = <&sb2>;
++		status = "disabled";
++	};
++
+ 	arm_pmu: arm-pmu {
+ 		compatible = "arm,cortex-a53-pmu";
+ 		interrupts = <GIC_SPI 48 IRQ_TYPE_LEVEL_HIGH>;
+ 	};
+ 
++	/*
++	 * There is no clock controller driver yet. The I2C, RTC and watchdog
++	 * blocks run from this oscillator through enable gates in CRT
++	 * (0x0c/0x10) and ISO (0x8c), so they reference osc27M directly for
++	 * now and rely on the bootloader having enabled their gates.
++	 */
+ 	osc27M: osc {
+ 		compatible = "fixed-clock";
+ 		clock-frequency = <27000000>;
+@@ -81,6 +111,107 @@ iso: syscon@7000 {
+ 				ranges = <0x0 0x7000 0x1000>;
+ 			};
+ 
++			/*
++			 * USB: the DRD controller (usb@13200) and the USB 2.0
++			 * host (usb@13c00) share interrupt SPI 21. The CRT
++			 * resets of all USB ports are listed on every
++			 * controller because the vendor bring-up releases all
++			 * PHY resets before the USB3 PHY MDIO resets and the
++			 * common USB reset. The common USB clock gate (CRT 0x0c
++			 * bit 4) is only on when the boot loader used USB, so
++			 * the glue runs the vendor clock sequence, described by
++			 * "realtek,usb-clock" (gate, then the number of PHY
++			 * resets released before the clock pulse).
++			 */
++			usb_drd: usb@13200 {
++				compatible = "realtek,rtd1295-dwc3", "realtek,rtd-dwc3";
++				reg = <0x13200 0x200>;
++				#address-cells = <1>;
++				#size-cells = <1>;
++				ranges;
++				resets = <&reset1 RTD1295_RSTN_USB_PHY0>,
++					 <&reset1 RTD1295_RSTN_USB_PHY1>,
++					 <&reset2 RTD1295_RSTN_USB_PHY2>,
++					 <&reset2 RTD1295_RSTN_USB_PHY3>,
++					 <&reset1 RTD1295_RSTN_USB3_PHY0_POW>,
++					 <&reset2 RTD1295_RSTN_USB3_PHY1_POW>,
++					 <&reset1 RTD1295_RSTN_USB3_P0_MDIO>,
++					 <&reset2 RTD1295_RSTN_USB3_P1_MDIO>,
++					 <&reset1 RTD1295_RSTN_USB>;
++				realtek,usb-clock = <&crt 0x0c 4 6>;
++				status = "disabled";
++
++				usb_drd_dwc3: usb@20000 {
++					compatible = "snps,dwc3";
++					reg = <0x20000 0x9000>;
++					interrupts = <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH>;
++					phys = <&usb2phy_drd>, <&usb3phy_drd>;
++					phy-names = "usb2-phy", "usb3-phy";
++					snps,dis_u2_susphy_quirk;
++				};
++			};
++
++			usb3phy_drd: usb-phy@13210 {
++				compatible = "realtek,rtd1295-usb3phy";
++				reg = <0x13210 0x4>;
++				#phy-cells = <0>;
++				status = "disabled";
++			};
++
++			usb2phy_drd: usb-phy@13214 {
++				compatible = "realtek,rtd1295-usb2phy";
++				reg = <0x13214 0x4>, <0x28280 0x4>;
++				#phy-cells = <0>;
++				status = "disabled";
++			};
++
++			usb_u2host: usb@13c00 {
++				compatible = "realtek,rtd1295-dwc3", "realtek,rtd-dwc3";
++				reg = <0x13c00 0x200>;
++				#address-cells = <1>;
++				#size-cells = <1>;
++				ranges;
++				resets = <&reset1 RTD1295_RSTN_USB_PHY0>,
++					 <&reset1 RTD1295_RSTN_USB_PHY1>,
++					 <&reset2 RTD1295_RSTN_USB_PHY2>,
++					 <&reset2 RTD1295_RSTN_USB_PHY3>,
++					 <&reset1 RTD1295_RSTN_USB3_PHY0_POW>,
++					 <&reset2 RTD1295_RSTN_USB3_PHY1_POW>,
++					 <&reset1 RTD1295_RSTN_USB3_P0_MDIO>,
++					 <&reset2 RTD1295_RSTN_USB3_P1_MDIO>,
++					 <&reset1 RTD1295_RSTN_USB>;
++				realtek,usb-clock = <&crt 0x0c 4 6>;
++				status = "disabled";
++
++				usb@29000 {
++					compatible = "snps,dwc3";
++					reg = <0x29000 0x9000>;
++					interrupts = <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH>;
++					phys = <&usb2phy_u2host>;
++					phy-names = "usb2-phy";
++					dr_mode = "host";
++					snps,dis_u2_susphy_quirk;
++				};
++			};
++
++			usb2phy_u2host: usb-phy@13c14 {
++				compatible = "realtek,rtd1295-usb2phy";
++				reg = <0x13c14 0x4>, <0x31280 0x4>;
++				#phy-cells = <0>;
++				status = "disabled";
++			};
++
++			emmc: mmc@12000 {
++				compatible = "realtek,rtd1295-dw-mshc";
++				reg = <0x12000 0xa00>;
++				interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>;
++				clock-frequency = <100000000>;
++				fifo-depth = <128>;
++				realtek,crt-syscon = <&crt>;
++				realtek,sb2-syscon = <&sb2>;
++				status = "disabled";
++			};
++
+ 			sb2: syscon@1a000 {
+ 				compatible = "syscon", "simple-mfd";
+ 				reg = <0x1a000 0x1000>;
+@@ -99,6 +230,12 @@ misc: syscon@1b000 {
+ 				ranges = <0x0 0x1b000 0x1000>;
+ 			};
+ 
++			sb4: syscon@1c600 {
++				compatible = "realtek,rtd1295-sb4", "syscon";
++				reg = <0x1c600 0x18>;
++				reg-io-width = <4>;
++			};
++
+ 			scpu_wrapper: syscon@1d000 {
+ 				compatible = "syscon", "simple-mfd";
+ 				reg = <0x1d000 0x2000>;
+@@ -107,6 +244,112 @@ scpu_wrapper: syscon@1d000 {
+ 				#size-cells = <1>;
+ 				ranges = <0x0 0x1d000 0x2000>;
+ 			};
++
++			/*
++			 * SATA: two-port AHCI with a Realtek wrapper; its last
++			 * registers (0x3ff60) are the PHY MDIO bridge. There
++			 * is no clock driver yet; the AHCI glue sets the CRT
++			 * gates (clk_en_sata_N, clk_en_sata_alive_N) itself.
++			 * The vendor kernels leave sata_func_exist_N alone, so
++			 * it is not described.
++			 */
++			sata: sata@3f000 {
++				compatible = "realtek,rtd1295-ahci";
++				reg = <0x3f000 0xf60>;
++				interrupts = <GIC_SPI 28 IRQ_TYPE_LEVEL_HIGH>;
++				resets = <&reset1 RTD1295_RSTN_SATA_0>,
++					 <&reset4 RTD1295_RSTN_SATA_1>;
++				reset-names = "sata0", "sata1";
++				realtek,crt-syscon = <&crt>;
++				#address-cells = <1>;
++				#size-cells = <0>;
++				status = "disabled";
++
++				sata_port0: sata-port@0 {
++					reg = <0>;
++					phys = <&sata_phy 0>;
++				};
++
++				sata_port1: sata-port@1 {
++					reg = <1>;
++					phys = <&sata_phy 1>;
++				};
++			};
++
++			sata_phy: phy@3ff60 {
++				compatible = "realtek,rtd1295-sata-phy";
++				reg = <0x3ff60 0xc>;
++				resets = <&reset1 RTD1295_RSTN_SATA_PHY_0>,
++					 <&reset1 RTD1295_RSTN_SATA_PHY_POW_0>,
++					 <&reset4 RTD1295_RSTN_SATA_PHY_1>,
++					 <&reset4 RTD1295_RSTN_SATA_PHY_POW_1>;
++				reset-names = "phy0", "pow0", "phy1", "pow1";
++				realtek,sb2-syscon = <&sb2>;
++				#phy-cells = <1>;
++				status = "disabled";
++			};
++		};
++
++		pcie2: pcie@9803b000 {
++			compatible = "realtek,rtd1295-pcie-slot2";
++			reg = <0x9803b000 0x1000>,
++			      <0x9803c000 0x1000>;
++			reg-names = "ctrl", "cfg";
++			device_type = "pci";
++			#address-cells = <3>;
++			#size-cells = <2>;
++			bus-range = <0x01 0xff>;
++			linux,pci-domain = <1>;
++			num-lanes = <1>;
++			max-link-speed = <2>;
++			ranges = <0x02000000 0x0 0xc1000000 0xc1000000 0x0 0x01000000>;
++			#interrupt-cells = <1>;
++			interrupt-map-mask = <0 0 0 0>;
++			interrupt-map = <0 0 0 0 &gic GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH>;
++			resets = <&reset2 RTD1295_RSTN_PCIE1_STITCH>,
++				 <&reset2 RTD1295_RSTN_PCIE1>,
++				 <&reset2 RTD1295_RSTN_PCIE1_CORE>,
++				 <&reset2 RTD1295_RSTN_PCIE1_POWER>,
++				 <&reset2 RTD1295_RSTN_PCIE1_NONSTICH>,
++				 <&reset2 RTD1295_RSTN_PCIE1_PHY>,
++				 <&reset4 RTD1295_RSTN_PCIE1_PHY_MDIO>;
++			reset-names = "stitch", "pcie", "core", "power",
++				      "nonstitch", "phy", "phy-mdio";
++			realtek,sb2-syscon = <&sb2>;
++			realtek,sb4-syscon = <&sb4>;
++			realtek,crt-syscon = <&crt>;
++			status = "disabled";
++		};
++
++		pcie1: pcie@9804e000 {
++			compatible = "realtek,rtd1295-pcie-slot1";
++			reg = <0x9804e000 0x1000>,
++			      <0x9804f000 0x1000>;
++			reg-names = "ctrl", "cfg";
++			device_type = "pci";
++			#address-cells = <3>;
++			#size-cells = <2>;
++			bus-range = <0x00 0xff>;
++			linux,pci-domain = <0>;
++			num-lanes = <1>;
++			max-link-speed = <1>;
++			ranges = <0x02000000 0x0 0xc0000000 0xc0000000 0x0 0x01000000>;
++			#interrupt-cells = <1>;
++			interrupt-map-mask = <0 0 0 0>;
++			interrupt-map = <0 0 0 0 &gic GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH>;
++			resets = <&reset2 RTD1295_RSTN_PCIE0_STITCH>,
++				 <&reset2 RTD1295_RSTN_PCIE0>,
++				 <&reset2 RTD1295_RSTN_PCIE0_CORE>,
++				 <&reset2 RTD1295_RSTN_PCIE0_POWER>,
++				 <&reset2 RTD1295_RSTN_PCIE0_NONSTICH>,
++				 <&reset2 RTD1295_RSTN_PCIE0_PHY>,
++				 <&reset4 RTD1295_RSTN_PCIE0_PHY_MDIO>;
++			reset-names = "stitch", "pcie", "core", "power",
++				      "nonstitch", "phy", "phy-mdio";
++			realtek,sb2-syscon = <&sb2>;
++			realtek,sb4-syscon = <&sb4>;
++			realtek,crt-syscon = <&crt>;
++			status = "disabled";
+ 		};
+ 
+ 		gic: interrupt-controller@ff011000 {
+@@ -118,6 +361,7 @@ gic: interrupt-controller@ff011000 {
+ 			interrupts = <GIC_PPI 9 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>;
+ 			interrupt-controller;
+ 			#interrupt-cells = <3>;
++			#address-cells = <0>;
+ 		};
+ 	};
+ };
+@@ -146,15 +390,49 @@ reset4: reset-controller@50 {
+ 		reg = <0x50 0x4>;
+ 		#reset-cells = <1>;
+ 	};
++
++	scpu_pll: clock-controller@500 {
++		compatible = "realtek,rtd1295-scpu-pll";
++		reg = <0x500 0x20>;
++		clocks = <&osc27M>;
++		#clock-cells = <0>;
++	};
+ };
+ 
+ &iso {
++	iso_irq_mux: interrupt-controller@0 {
++		compatible = "realtek,rtd1295-iso-irq-mux";
++		reg = <0x0 0x100>;
++		interrupts = <GIC_SPI 41 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-controller;
++		#interrupt-cells = <1>;
++	};
++
+ 	iso_reset: reset-controller@88 {
+ 		compatible = "snps,dw-low-reset";
+ 		reg = <0x88 0x4>;
+ 		#reset-cells = <1>;
+ 	};
+ 
++	pwm: pwm@d0 {
++		compatible = "realtek,rtd1295-pwm";
++		reg = <0xd0 0xc>;
++		clocks = <&osc27M>;
++		#pwm-cells = <2>;
++		status = "disabled";
++	};
++
++	iso_gpio: gpio@100 {
++		compatible = "realtek,rtd1295-iso-gpio";
++		reg = <0x100 0x100>,
++		      <0x0 0xe8>;
++		interrupt-parent = <&iso_irq_mux>;
++		interrupts = <19>, <20>;
++		/* TODO: gpio-ranges once there is a RTD1295 pinctrl driver */
++		gpio-controller;
++		#gpio-cells = <2>;
++	};
++
+ 	wdt: watchdog@680 {
+ 		compatible = "realtek,rtd1295-watchdog";
+ 		reg = <0x680 0x100>;
+@@ -168,11 +446,76 @@ uart0: serial@800 {
+ 		reg-io-width = <4>;
+ 		clock-frequency = <27000000>;
+ 		resets = <&iso_reset RTD1295_ISO_RSTN_UR0>;
++		interrupt-parent = <&iso_irq_mux>;
++		interrupts = <2>;
++		status = "disabled";
++	};
++
++	i2c_1: i2c@c00 {
++		compatible = "snps,designware-i2c";
++		reg = <0xc00 0x100>;
++		/* Placeholder for the I2C clock gate, see osc27M */
++		clocks = <&osc27M>;
++		resets = <&iso_reset RTD1295_ISO_RSTN_I2C_1>;
++		interrupt-parent = <&iso_irq_mux>;
++		interrupts = <11>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "disabled";
++	};
++
++	i2c_0: i2c@d00 {
++		compatible = "snps,designware-i2c";
++		reg = <0xd00 0x100>;
++		/* Placeholder for the I2C clock gate, see osc27M */
++		clocks = <&osc27M>;
++		resets = <&iso_reset RTD1295_ISO_RSTN_I2C_0>;
++		interrupt-parent = <&iso_irq_mux>;
++		interrupts = <8>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "disabled";
++	};
++};
++
++&rbus {
++	/*
++	 * RTL8168g family MAC with embedded PHY. There is no clock driver for
++	 * its ISO clock gates (ETN_SYS, ETN_250M) yet; the driver checks them
++	 * through the ISO syscon and the boot loader normally leaves them on.
++	 */
++	gmac: ethernet@16000 {
++		compatible = "realtek,rtd1295-gmac";
++		reg = <0x16000 0x1000>;
++		interrupts = <GIC_SPI 22 IRQ_TYPE_LEVEL_HIGH>;
++		resets = <&iso_reset RTD1295_ISO_RSTN_GMAC>,
++			 <&iso_reset RTD1295_ISO_RSTN_GPHY>;
++		reset-names = "gmac", "gphy";
++		realtek,iso-syscon = <&iso>;
+ 		status = "disabled";
+ 	};
+ };
+ 
+ &misc {
++	misc_irq_mux: interrupt-controller@0 {
++		compatible = "realtek,rtd1295-misc-irq-mux";
++		reg = <0x0 0x100>;
++		interrupts = <GIC_SPI 40 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-controller;
++		#interrupt-cells = <1>;
++	};
++
++	misc_gpio: gpio@100 {
++		compatible = "realtek,rtd1295-misc-gpio";
++		reg = <0x100 0x100>,
++		      <0x0 0xc0>;
++		interrupt-parent = <&misc_irq_mux>;
++		interrupts = <19>, <20>;
++		/* TODO: gpio-ranges once there is a RTD1295 pinctrl driver */
++		gpio-controller;
++		#gpio-cells = <2>;
++	};
++
+ 	uart1: serial@200 {
+ 		compatible = "snps,dw-apb-uart";
+ 		reg = <0x200 0x100>;
+@@ -180,6 +523,8 @@ uart1: serial@200 {
+ 		reg-io-width = <4>;
+ 		clock-frequency = <432000000>;
+ 		resets = <&reset2 RTD1295_RSTN_UR1>;
++		interrupt-parent = <&misc_irq_mux>;
++		interrupts = <3>;
+ 		status = "disabled";
+ 	};
+ 
+@@ -190,6 +535,104 @@ uart2: serial@400 {
+ 		reg-io-width = <4>;
+ 		clock-frequency = <432000000>;
+ 		resets = <&reset2 RTD1295_RSTN_UR2>;
++		interrupt-parent = <&misc_irq_mux>;
++		interrupts = <8>;
++		status = "disabled";
++	};
++
++	rtc: rtc@600 {
++		compatible = "realtek,rtd1295-rtc";
++		reg = <0x600 0x100>;
++		/* Placeholder for the MISC_RTC clock gate (CRT 0x10 bit 10) */
++		clocks = <&osc27M>;
++		status = "disabled";
++	};
++
++	i2c_2: i2c@700 {
++		compatible = "snps,designware-i2c";
++		reg = <0x700 0x100>;
++		/* Placeholder for the I2C clock gate, see osc27M */
++		clocks = <&osc27M>;
++		resets = <&reset2 RTD1295_RSTN_I2C_2>;
++		interrupt-parent = <&misc_irq_mux>;
++		interrupts = <26>;
++		#address-cells = <1>;
++		#size-cells = <0>;
+ 		status = "disabled";
+ 	};
++
++	i2c_3: i2c@900 {
++		compatible = "snps,designware-i2c";
++		reg = <0x900 0x100>;
++		/* Placeholder for the I2C clock gate, see osc27M */
++		clocks = <&osc27M>;
++		resets = <&reset2 RTD1295_RSTN_I2C_3>;
++		interrupt-parent = <&misc_irq_mux>;
++		interrupts = <23>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "disabled";
++	};
++
++	i2c_4: i2c@a00 {
++		compatible = "snps,designware-i2c";
++		reg = <0xa00 0x100>;
++		/* Placeholder for the I2C clock gate, see osc27M */
++		clocks = <&osc27M>;
++		resets = <&reset2 RTD1295_RSTN_I2C_4>;
++		interrupt-parent = <&misc_irq_mux>;
++		interrupts = <15>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "disabled";
++	};
++
++	i2c_5: i2c@b00 {
++		compatible = "snps,designware-i2c";
++		reg = <0xb00 0x100>;
++		/* Placeholder for the I2C clock gate, see osc27M */
++		clocks = <&osc27M>;
++		resets = <&reset2 RTD1295_RSTN_I2C_5>;
++		interrupt-parent = <&misc_irq_mux>;
++		interrupts = <14>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "disabled";
++	};
++};
++
++&scpu_wrapper {
++	cpu_tm: thermal-sensor@150 {
++		compatible = "realtek,rtd1295-thermal";
++		reg = <0x150 0x1c>;
++		#thermal-sensor-cells = <0>;
++	};
++};
++
++/ {
++	thermal-zones {
++		/*
++		 * Trip points of the vendor kernel. Boards with CPU voltage
++		 * scaling add the CPUs as cooling devices of cpu_alert.
++		 */
++		cpu_thermal: cpu-thermal {
++			polling-delay-passive = <250>;
++			polling-delay = <1000>;
++			thermal-sensors = <&cpu_tm>;
++
++			trips {
++				cpu_alert: cpu-alert {
++					temperature = <115000>;
++					hysteresis = <3000>;
++					type = "passive";
++				};
++
++				cpu_crit: cpu-crit {
++					temperature = <130000>;
++					hysteresis = <0>;
++					type = "critical";
++				};
++			};
++		};
++	};
+ };

@@ -1,0 +1,286 @@
+From 03f4755b318e8b9acaac0736ea133e8eeed26d77 Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 18/40] pwm: Add the Realtek RTD1295 PWM driver
+
+The RTD1295/RTD1296 ISO block has a four-channel PWM. Each channel has
+a 4-bit power-of-two prescaler (CSD), an 8-bit period divider (OCD) and
+an 8-bit duty value (CD), packed per channel into three shared
+registers. The output frequency is clk / (2^(CSD + 1) * (OCD + 1)) and
+the duty cycle (CD + 1) / (OCD + 1), as in the vendor driver of the
+QNAP 4.2.8 GPL kernel.
+
+There is no enable bit; like the vendor driver, a disabled channel has
+all fields cleared. The duty cycle cannot go below one tick, so smaller
+requests are rounded up, and only normal polarity is supported.
+
+On the QNAP TS-328 channels 0 and 3 drive the drive bay LEDs.
+---
+ drivers/pwm/Kconfig       |  11 ++
+ drivers/pwm/Makefile      |   1 +
+ drivers/pwm/pwm-rtd1295.c | 222 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 234 insertions(+)
+ create mode 100644 drivers/pwm/pwm-rtd1295.c
+
+diff --git a/drivers/pwm/Kconfig b/drivers/pwm/Kconfig
+index c2fd3f4b6..b1c8ac4e3 100644
+--- a/drivers/pwm/Kconfig
++++ b/drivers/pwm/Kconfig
+@@ -615,6 +615,17 @@ config PWM_ROCKCHIP
+ 	  Generic PWM framework driver for the PWM controller found on
+ 	  Rockchip SoCs.
+ 
++config PWM_RTD1295
++	tristate "Realtek RTD1295 PWM support"
++	depends on ARCH_REALTEK || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  PWM driver for the four-channel PWM controller in the ISO block
++	  of the Realtek RTD1295 and RTD1296 SoCs.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called pwm-rtd1295.
++
+ config PWM_SAMSUNG
+ 	tristate "Samsung PWM support"
+ 	depends on PLAT_SAMSUNG || ARCH_S5PV210 || ARCH_EXYNOS || COMPILE_TEST
+diff --git a/drivers/pwm/Makefile b/drivers/pwm/Makefile
+index dfa8b4966..417f7f4bb 100644
+--- a/drivers/pwm/Makefile
++++ b/drivers/pwm/Makefile
+@@ -55,6 +55,7 @@ obj-$(CONFIG_PWM_RENESAS_RZG2L_GPT)	+= pwm-rzg2l-gpt.o
+ obj-$(CONFIG_PWM_RENESAS_RZ_MTU3)	+= pwm-rz-mtu3.o
+ obj-$(CONFIG_PWM_RENESAS_TPU)	+= pwm-renesas-tpu.o
+ obj-$(CONFIG_PWM_ROCKCHIP)	+= pwm-rockchip.o
++obj-$(CONFIG_PWM_RTD1295)	+= pwm-rtd1295.o
+ obj-$(CONFIG_PWM_SAMSUNG)	+= pwm-samsung.o
+ obj-$(CONFIG_PWM_SIFIVE)	+= pwm-sifive.o
+ obj-$(CONFIG_PWM_SL28CPLD)	+= pwm-sl28cpld.o
+diff --git a/drivers/pwm/pwm-rtd1295.c b/drivers/pwm/pwm-rtd1295.c
+new file mode 100644
+index 000000000..8e77a3c0c
+--- /dev/null
++++ b/drivers/pwm/pwm-rtd1295.c
+@@ -0,0 +1,222 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Realtek RTD1295/RTD1296 PWM controller
++ *
++ * Register layout and divider model from the Realtek/QNAP vendor driver
++ * in the QNAP 4.2.8 GPL kernel (pwm-rtd1295.c), which is
++ * Copyright (c) 2014, Realtek Corporation.
++ *
++ * The block in the ISO domain has four channels. Each one has three
++ * fields, packed per channel into three shared registers:
++ *
++ *   CSD  clock source divider, 4 bits: tick = clk / 2^(CSD + 1)
++ *   OCD  output clock divider, 8 bits: period = (OCD + 1) ticks
++ *   CD   duty,                 8 bits: active for (CD + 1) ticks
++ *
++ * Limitations:
++ * - There is no separate enable bit. Like the vendor driver, a disabled
++ *   channel has all three fields cleared; the pin level in that state is
++ *   not documented.
++ * - The duty cycle is at least one tick, so 0% cannot be produced. Smaller
++ *   requests are rounded up to one tick.
++ * - Only normal polarity is supported.
++ * - A new setting is written field by field and may produce one mixed
++ *   period.
++ */
++
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/io.h>
++#include <linux/math64.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/pwm.h>
++#include <linux/spinlock.h>
++
++#define RTD1295_PWM_OCD			0x0
++#define RTD1295_PWM_CD			0x4
++#define RTD1295_PWM_CSD			0x8
++
++#define RTD1295_PWM_NUM			4
++
++/* Per-channel field position in the shared registers */
++#define RTD1295_PWM_OCD_SHIFT(ch)	((ch) * 8)
++#define RTD1295_PWM_CD_SHIFT(ch)	((ch) * 8)
++#define RTD1295_PWM_CSD_SHIFT(ch)	((ch) * 4)
++#define RTD1295_PWM_OCD_MASK		GENMASK(7, 0)
++#define RTD1295_PWM_CD_MASK		GENMASK(7, 0)
++#define RTD1295_PWM_CSD_MASK		GENMASK(3, 0)
++
++#define RTD1295_PWM_OCD_MAX		255
++#define RTD1295_PWM_CSD_MAX		15
++
++struct rtd1295_pwm {
++	void __iomem *base;
++	unsigned long rate;
++	/* Serializes the read-modify-write of the shared registers */
++	spinlock_t lock;
++};
++
++static inline struct rtd1295_pwm *to_rtd1295_pwm(struct pwm_chip *chip)
++{
++	return pwmchip_get_drvdata(chip);
++}
++
++static void rtd1295_pwm_update(struct rtd1295_pwm *rp, u32 reg,
++			       unsigned int shift, u32 mask, u32 val)
++{
++	u32 tmp;
++
++	tmp = readl(rp->base + reg);
++	tmp &= ~(mask << shift);
++	tmp |= (val & mask) << shift;
++	writel(tmp, rp->base + reg);
++}
++
++static u32 rtd1295_pwm_field(struct rtd1295_pwm *rp, u32 reg,
++			     unsigned int shift, u32 mask)
++{
++	return (readl(rp->base + reg) >> shift) & mask;
++}
++
++static void rtd1295_pwm_write(struct rtd1295_pwm *rp, unsigned int ch,
++			      u32 csd, u32 ocd, u32 cd)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&rp->lock, flags);
++	rtd1295_pwm_update(rp, RTD1295_PWM_CSD, RTD1295_PWM_CSD_SHIFT(ch),
++			   RTD1295_PWM_CSD_MASK, csd);
++	rtd1295_pwm_update(rp, RTD1295_PWM_OCD, RTD1295_PWM_OCD_SHIFT(ch),
++			   RTD1295_PWM_OCD_MASK, ocd);
++	rtd1295_pwm_update(rp, RTD1295_PWM_CD, RTD1295_PWM_CD_SHIFT(ch),
++			   RTD1295_PWM_CD_MASK, cd);
++	spin_unlock_irqrestore(&rp->lock, flags);
++}
++
++static int rtd1295_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
++			     const struct pwm_state *state)
++{
++	struct rtd1295_pwm *rp = to_rtd1295_pwm(chip);
++	u64 period_cycles, duty_cycles, ticks;
++	u32 csd, ocd, cd;
++
++	if (state->polarity != PWM_POLARITY_NORMAL)
++		return -EINVAL;
++
++	if (!state->enabled) {
++		rtd1295_pwm_write(rp, pwm->hwpwm, 0, 0, 0);
++		return 0;
++	}
++
++	period_cycles = mul_u64_u64_div_u64(state->period, rp->rate,
++					    NSEC_PER_SEC);
++	duty_cycles = mul_u64_u64_div_u64(state->duty_cycle, rp->rate,
++					  NSEC_PER_SEC);
++
++	/* Smallest prescaler that fits the period, for the best resolution */
++	for (csd = 0; csd < RTD1295_PWM_CSD_MAX; csd++)
++		if ((period_cycles >> (csd + 1)) <= RTD1295_PWM_OCD_MAX + 1)
++			break;
++
++	/* All-zero fields mean "disabled", so the period is at least 2 ticks */
++	ticks = min_t(u64, period_cycles >> (csd + 1), RTD1295_PWM_OCD_MAX + 1);
++	if (ticks < 2)
++		return -EINVAL;
++	ocd = ticks - 1;
++
++	ticks = min_t(u64, duty_cycles >> (csd + 1), ocd + 1);
++	cd = ticks ? ticks - 1 : 0;
++
++	rtd1295_pwm_write(rp, pwm->hwpwm, csd, ocd, cd);
++
++	return 0;
++}
++
++static int rtd1295_pwm_get_state(struct pwm_chip *chip, struct pwm_device *pwm,
++				 struct pwm_state *state)
++{
++	struct rtd1295_pwm *rp = to_rtd1295_pwm(chip);
++	unsigned int ch = pwm->hwpwm;
++	u32 csd, ocd, cd;
++
++	csd = rtd1295_pwm_field(rp, RTD1295_PWM_CSD, RTD1295_PWM_CSD_SHIFT(ch),
++				RTD1295_PWM_CSD_MASK);
++	ocd = rtd1295_pwm_field(rp, RTD1295_PWM_OCD, RTD1295_PWM_OCD_SHIFT(ch),
++				RTD1295_PWM_OCD_MASK);
++	cd = rtd1295_pwm_field(rp, RTD1295_PWM_CD, RTD1295_PWM_CD_SHIFT(ch),
++			       RTD1295_PWM_CD_MASK);
++
++	state->polarity = PWM_POLARITY_NORMAL;
++	state->enabled = csd || ocd || cd;
++	if (!state->enabled)
++		return 0;
++
++	cd = min(cd, ocd);
++	state->period = DIV64_U64_ROUND_UP(((u64)(ocd + 1) << (csd + 1)) *
++					   NSEC_PER_SEC, rp->rate);
++	state->duty_cycle = DIV64_U64_ROUND_UP(((u64)(cd + 1) << (csd + 1)) *
++					       NSEC_PER_SEC, rp->rate);
++
++	return 0;
++}
++
++static const struct pwm_ops rtd1295_pwm_ops = {
++	.apply = rtd1295_pwm_apply,
++	.get_state = rtd1295_pwm_get_state,
++};
++
++static int rtd1295_pwm_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct pwm_chip *chip;
++	struct rtd1295_pwm *rp;
++	struct clk *clk;
++	int ret;
++
++	chip = devm_pwmchip_alloc(dev, RTD1295_PWM_NUM, sizeof(*rp));
++	if (IS_ERR(chip))
++		return PTR_ERR(chip);
++	rp = to_rtd1295_pwm(chip);
++
++	rp->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(rp->base))
++		return PTR_ERR(rp->base);
++
++	clk = devm_clk_get_enabled(dev, NULL);
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk), "failed to get clock\n");
++
++	rp->rate = clk_get_rate(clk);
++	if (!rp->rate || rp->rate > NSEC_PER_SEC)
++		return dev_err_probe(dev, -EINVAL, "invalid clock rate %lu\n",
++				     rp->rate);
++
++	spin_lock_init(&rp->lock);
++	chip->ops = &rtd1295_pwm_ops;
++
++	ret = devm_pwmchip_add(dev, chip);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to add PWM chip\n");
++
++	return 0;
++}
++
++static const struct of_device_id rtd1295_pwm_of_match[] = {
++	{ .compatible = "realtek,rtd1295-pwm" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, rtd1295_pwm_of_match);
++
++static struct platform_driver rtd1295_pwm_driver = {
++	.probe = rtd1295_pwm_probe,
++	.driver = {
++		.name = "pwm-rtd1295",
++		.of_match_table = rtd1295_pwm_of_match,
++	},
++};
++module_platform_driver(rtd1295_pwm_driver);
++
++MODULE_DESCRIPTION("Realtek RTD1295 PWM driver");
++MODULE_LICENSE("GPL");

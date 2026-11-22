@@ -1,0 +1,311 @@
+From 1f470c028799d4955bd96b8d83e55736cf2ab167 Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 24/40] mmc: dw_mmc: Add hooks for glue drivers
+
+The eMMC controller of the Realtek RTD129x SoCs is a DesignWare MSHC,
+but every access to its registers has to be serialized against
+accesses by other drivers to a range of RBUS registers (an SoC
+erratum), the vendor driver issues a bus sync before each register
+write, and its IDMAC needs help to complete transfers. Add three
+optional hooks for glue drivers:
+
+- struct dw_mci_reg_ops in struct dw_mci, behind CONFIG_MMC_DW_REG_OPS,
+  which glue drivers select. When a glue driver installs it, mci_readl()
+  and mci_writel() go through its readl/writel callbacks, and the PIO
+  FIFO bursts are bracketed by optional fifo_begin/fifo_end callbacks.
+  The four readl_poll_timeout_atomic() calls that read host->regs
+  directly now poll through dw_mci_poll_readl(), which uses the
+  override when one is installed and is readl(), with its barrier,
+  otherwise. Hosts without an override access the registers exactly as
+  before.
+
+- drv_data->dma_complete(), called from the IDMAC completion path
+  before the DMA buffers are cleaned up. The RTD129x wrapper has its
+  own DMA_DONE flag, which the vendor driver waits for after a read
+  before it uses the data.
+
+- dw_mci_handle_pending_irq(), so that a glue driver which polls the
+  status registers can process interrupts that the hardware did not
+  deliver. The caller keeps the controller interrupt disabled, so the
+  handler never runs twice at the same time.
+---
+ drivers/mmc/host/dw_mmc.c | 44 +++++++++++++----
+ drivers/mmc/host/dw_mmc.h | 99 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 135 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index 90cc41901..a10ac28c6 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -197,9 +197,10 @@ static bool dw_mci_ctrl_reset(struct dw_mci *host, u32 reset)
+ 	mci_writel(host, CTRL, ctrl);
+ 
+ 	/* wait till resets clear */
+-	if (readl_poll_timeout_atomic(host->regs + SDMMC_CTRL, ctrl,
++	if (read_poll_timeout_atomic(dw_mci_poll_readl, ctrl,
+ 				      !(ctrl & reset),
+-				      1, 500 * USEC_PER_MSEC)) {
++				      1, 500 * USEC_PER_MSEC,
++				      false, host, SDMMC_CTRL)) {
+ 		dev_err(host->dev,
+ 			"Timeout resetting block (ctrl reset %#x)\n",
+ 			ctrl & reset);
+@@ -223,10 +224,11 @@ static void dw_mci_wait_while_busy(struct dw_mci *host, u32 cmd_flags)
+ 	 */
+ 	if ((cmd_flags & SDMMC_CMD_PRV_DAT_WAIT) &&
+ 	    !(cmd_flags & SDMMC_CMD_VOLT_SWITCH)) {
+-		if (readl_poll_timeout_atomic(host->regs + SDMMC_STATUS,
++		if (read_poll_timeout_atomic(dw_mci_poll_readl,
+ 					      status,
+ 					      !(status & SDMMC_STATUS_BUSY),
+-					      10, 500 * USEC_PER_MSEC))
++					      10, 500 * USEC_PER_MSEC,
++					      false, host, SDMMC_STATUS))
+ 			dev_err(host->dev, "Busy; trying anyway\n");
+ 	}
+ }
+@@ -241,9 +243,10 @@ static void mci_send_cmd(struct dw_mci_slot *slot, u32 cmd, u32 arg)
+ 	dw_mci_wait_while_busy(host, cmd);
+ 	mci_writel(host, CMD, SDMMC_CMD_START | cmd);
+ 
+-	if (readl_poll_timeout_atomic(host->regs + SDMMC_CMD, cmd_status,
++	if (read_poll_timeout_atomic(dw_mci_poll_readl, cmd_status,
+ 				      !(cmd_status & SDMMC_CMD_START),
+-				      1, 500 * USEC_PER_MSEC))
++				      1, 500 * USEC_PER_MSEC,
++				      false, host, SDMMC_CMD))
+ 		dev_err(&slot->mmc->class_dev,
+ 			"Timeout sending command (cmd %#x arg %#x status %#x)\n",
+ 			cmd, arg, cmd_status);
+@@ -477,6 +480,10 @@ static void dw_mci_dmac_complete_dma(void *arg)
+ 
+ 	dev_vdbg(host->dev, "DMA complete\n");
+ 
++	if (data && host->use_dma == TRANS_MODE_IDMAC &&
++	    host->drv_data && host->drv_data->dma_complete)
++		host->drv_data->dma_complete(host, data);
++
+ 	if ((host->use_dma == TRANS_MODE_EDMAC) &&
+ 	    data && (data->flags & MMC_DATA_READ))
+ 		/* Invalidate cache after read */
+@@ -1773,10 +1780,11 @@ static bool dw_mci_reset(struct dw_mci *host)
+ 		}
+ 
+ 		/* Wait for dma_req to be cleared */
+-		if (readl_poll_timeout_atomic(host->regs + SDMMC_STATUS,
++		if (read_poll_timeout_atomic(dw_mci_poll_readl,
+ 					      status,
+ 					      !(status & SDMMC_STATUS_DMA_REQ),
+-					      1, 500 * USEC_PER_MSEC)) {
++					      1, 500 * USEC_PER_MSEC,
++					      false, host, SDMMC_STATUS)) {
+ 			dev_err(host->dev,
+ 				"%s: Timeout waiting for dma_req to be cleared\n",
+ 				__func__);
+@@ -2666,6 +2674,7 @@ static void dw_mci_pull_data64_32(struct dw_mci *host, void *buf, int cnt)
+ 
+ static void dw_mci_pull_data(struct dw_mci *host, void *buf, int cnt)
+ {
++	unsigned long cookie;
+ 	int len;
+ 
+ 	/* get remaining partial bytes */
+@@ -2676,7 +2685,9 @@ static void dw_mci_pull_data(struct dw_mci *host, void *buf, int cnt)
+ 	cnt -= len;
+ 
+ 	/* get the rest of the data */
++	cookie = dw_mci_fifo_begin(host);
+ 	host->pull_data(host, buf, cnt);
++	dw_mci_fifo_end(host, cookie);
+ }
+ 
+ static void dw_mci_read_data_pio(struct dw_mci *host, bool dto)
+@@ -2744,6 +2755,7 @@ static void dw_mci_write_data_pio(struct dw_mci *host)
+ 	unsigned int len;
+ 	unsigned int fifo_depth = host->fifo_depth;
+ 	unsigned int remain, fcnt;
++	unsigned long cookie;
+ 
+ 	do {
+ 		if (!sg_miter_next(sg_miter))
+@@ -2761,7 +2773,9 @@ static void dw_mci_write_data_pio(struct dw_mci *host)
+ 			len = min(remain, fcnt);
+ 			if (!len)
+ 				break;
++			cookie = dw_mci_fifo_begin(host);
+ 			host->push_data(host, (void *)(buf + offset), len);
++			dw_mci_fifo_end(host, cookie);
+ 			data->bytes_xfered += len;
+ 			offset += len;
+ 			remain -= len;
+@@ -2951,6 +2965,20 @@ static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
+ 	return IRQ_HANDLED;
+ }
+ 
++/**
++ * dw_mci_handle_pending_irq() - run the interrupt handler from a glue driver
++ * @host: the controller
++ *
++ * For glue drivers that poll for interrupts the hardware failed to deliver.
++ * The caller must keep the controller interrupt disabled (disable_irq())
++ * and local interrupts off, so the handler never runs twice at once.
++ */
++irqreturn_t dw_mci_handle_pending_irq(struct dw_mci *host)
++{
++	return dw_mci_interrupt(host->irq, host);
++}
++EXPORT_SYMBOL_GPL(dw_mci_handle_pending_irq);
++
+ static int dw_mci_init_slot_caps(struct dw_mci_slot *slot)
+ {
+ 	struct dw_mci *host = slot->host;
+diff --git a/drivers/mmc/host/dw_mmc.h b/drivers/mmc/host/dw_mmc.h
+index 648b4a564..93494a926 100644
+--- a/drivers/mmc/host/dw_mmc.h
++++ b/drivers/mmc/host/dw_mmc.h
+@@ -107,6 +107,7 @@ struct dw_mci_dma_slave {
+  * @pdata: Platform data associated with the MMC controller.
+  * @drv_data: Driver specific data for identified variant of the controller
+  * @priv: Implementation defined private data.
++ * @reg_ops: Optional register access overrides (CONFIG_MMC_DW_REG_OPS).
+  * @biu_clk: Pointer to bus interface unit clock instance.
+  * @ciu_clk: Pointer to card interface unit clock instance.
+  * @slot: Slots sharing this MMC controller.
+@@ -210,6 +211,9 @@ struct dw_mci {
+ 	struct dw_mci_board	*pdata;
+ 	const struct dw_mci_drv_data	*drv_data;
+ 	void			*priv;
++#ifdef CONFIG_MMC_DW_REG_OPS
++	const struct dw_mci_reg_ops	*reg_ops;
++#endif
+ 	struct clk		*biu_clk;
+ 	struct clk		*ciu_clk;
+ 	struct dw_mci_slot	*slot;
+@@ -499,11 +503,100 @@ static inline void mci_fifo_l_writeq(void __iomem *addr, u64 value)
+ 	mci_fifo_writel(addr + 4, proxy[1]);
+ }
+ 
++#ifdef CONFIG_MMC_DW_REG_OPS
++/**
++ * struct dw_mci_reg_ops - controller register access overrides
++ * @readl: read the 32-bit register at offset @reg.
++ * @writel: write @value to the 32-bit register at offset @reg.
++ * @fifo_begin: called before a burst of PIO FIFO accesses. The return
++ *	value is passed to @fifo_end. Optional.
++ * @fifo_end: called after a burst of PIO FIFO accesses. Optional.
++ *
++ * For controllers that need every register access wrapped, for example in
++ * a lock that is shared with other bus masters. Only the 32-bit register
++ * accessors are covered, so the controller must use 32-bit IDMAC
++ * descriptors.
++ */
++struct dw_mci_reg_ops {
++	u32 (*readl)(struct dw_mci *host, u32 reg);
++	void (*writel)(struct dw_mci *host, u32 reg, u32 value);
++	unsigned long (*fifo_begin)(struct dw_mci *host);
++	void (*fifo_end)(struct dw_mci *host, unsigned long cookie);
++};
++
++static inline u32 dw_mci_readl(struct dw_mci *host, u32 reg)
++{
++	if (unlikely(host->reg_ops))
++		return host->reg_ops->readl(host, reg);
++
++	return readl_relaxed(host->regs + reg);
++}
++
++/*
++ * For the register poll loops: readl(), with its barrier, as before the
++ * glue hooks were added. A glue driver's accessor is used as is.
++ */
++static inline u32 dw_mci_poll_readl(struct dw_mci *host, u32 reg)
++{
++	if (unlikely(host->reg_ops))
++		return host->reg_ops->readl(host, reg);
++
++	return readl(host->regs + reg);
++}
++
++static inline void dw_mci_writel(struct dw_mci *host, u32 reg, u32 value)
++{
++	if (unlikely(host->reg_ops))
++		host->reg_ops->writel(host, reg, value);
++	else
++		writel_relaxed(value, host->regs + reg);
++}
++
++static inline unsigned long dw_mci_fifo_begin(struct dw_mci *host)
++{
++	if (unlikely(host->reg_ops && host->reg_ops->fifo_begin))
++		return host->reg_ops->fifo_begin(host);
++
++	return 0;
++}
++
++static inline void dw_mci_fifo_end(struct dw_mci *host, unsigned long cookie)
++{
++	if (unlikely(host->reg_ops && host->reg_ops->fifo_end))
++		host->reg_ops->fifo_end(host, cookie);
++}
++
++/* Register access macros */
++#define mci_readl(dev, reg)			\
++	dw_mci_readl(dev, SDMMC_##reg)
++#define mci_writel(dev, reg, value)			\
++	dw_mci_writel(dev, SDMMC_##reg, value)
++#else
++static inline u32 dw_mci_readl(struct dw_mci *host, u32 reg)
++{
++	return readl_relaxed(host->regs + reg);
++}
++
++static inline u32 dw_mci_poll_readl(struct dw_mci *host, u32 reg)
++{
++	return readl(host->regs + reg);
++}
++
++static inline unsigned long dw_mci_fifo_begin(struct dw_mci *host)
++{
++	return 0;
++}
++
++static inline void dw_mci_fifo_end(struct dw_mci *host, unsigned long cookie)
++{
++}
++
+ /* Register access macros */
+ #define mci_readl(dev, reg)			\
+ 	readl_relaxed((dev)->regs + SDMMC_##reg)
+ #define mci_writel(dev, reg, value)			\
+ 	writel_relaxed((value), (dev)->regs + SDMMC_##reg)
++#endif
+ 
+ /* 16-bit FIFO access macros */
+ #define mci_readw(dev, reg)			\
+@@ -537,6 +630,7 @@ static inline void mci_fifo_l_writeq(void __iomem *addr, u64 value)
+ #endif
+ 
+ extern int dw_mci_probe(struct dw_mci *host);
++extern irqreturn_t dw_mci_handle_pending_irq(struct dw_mci *host);
+ extern void dw_mci_remove(struct dw_mci *host);
+ #ifdef CONFIG_PM
+ extern int dw_mci_runtime_suspend(struct device *device);
+@@ -597,6 +691,9 @@ struct dw_mci_slot {
+  * @set_data_timeout: implementation specific timeout.
+  * @get_drto_clks: implementation specific cycle count for data read timeout.
+  * @hw_reset: implementation specific HW reset.
++ * @dma_complete: called from the interrupt handler when the internal DMA
++ *	controller reports that @data has been transferred, before the
++ *	DMA buffers are unmapped.
+  *
+  * Provide controller implementation specific extensions. The usage of this
+  * data structure is fully optional and usage of each member in this structure
+@@ -618,5 +715,7 @@ struct dw_mci_drv_data {
+ 					  unsigned int timeout_ns);
+ 	u32		(*get_drto_clks)(struct dw_mci *host);
+ 	void		(*hw_reset)(struct dw_mci *host);
++	void		(*dma_complete)(struct dw_mci *host,
++					struct mmc_data *data);
+ };
+ #endif /* _DW_MMC_H_ */

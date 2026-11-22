@@ -1,0 +1,756 @@
+From dcc67dbd92ea2a89e8f5608c48e984d82b04c1eb Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 40/40] arm64: dts: realtek: Add the QNAP TS-328
+
+Add the QNAP TS-328 (RTD1296, 2 GiB), a three-bay NAS.
+
+- Memory: the vendor reservations for the audio CPU firmware and the
+  media carveouts, which U-Boot starts and which keep running, and a
+  ramoops region at the vendor address with the vendor record and
+  console sizes, so that either kernel can read the other's console
+  log after a warm reset.
+- CPUs: the firmware only implements PSCI v0.1 without function IDs,
+  so there is no psci node. U-Boot parks CPUs 1-3 on SB2 0x9801aa44,
+  which the vendor kernel releases with its "rtk-spin-table" method;
+  use the realtek,rtd1295-spin-table enable method.
+- DVFS: the SCPU PLL, the G2227 CPU rail and the vendor OPP table
+  ("frequency-table,rev1" and "voltage-table" for chip revision A01,
+  the same as the Realtek BSP 4.9 OPPs): 300 MHz to 1.4 GHz at 0.8 to
+  1.1 V. The L2 rail (LDO3) is coupled to the CPU rail with a 100 mV
+  maximum spread, which with its 0.9/0.95/1.0 V steps gives the L2
+  voltages of the vendor cpufreq driver. Every OPP allows up to 1.1 V,
+  as the coupler can only lower the CPU rail in steps while the L2 rail
+  comes down. 1.4 GHz is the suspend OPP, used for system suspend
+  only; on reboot and power-off the G2227 driver raises the rails back
+  to the boot loader voltage. The CPUs are the cooling device of the
+  passive trip.
+- I2C0 with the G2227 PMIC and I2C4 with the Epson RX8010 RTC, which
+  the vendor kernel uses as its RTC; it is rtc0, and the i2c0/i2c4
+  aliases keep the vendor bus numbering.
+- Pin muxing: there is no RTD1295 pinctrl driver yet, and without the
+  vendor pinctrl hog values the RX8010 does not ACK. Set the I2C0,
+  I2C4, UART2, PWM and button pad mux fields with pinctrl-single as an
+  interim measure.
+- eMMC: 8-bit bus, high-speed SDR at 50 MHz, the vendor pddrive_nf_s0
+  drive codes, and realtek,read-only until the read tests have passed;
+  dw_mmc_rtd129x.allow_writes=1 allows writes.
+- PCIe: slot 1 carries the RTL8111 for LAN1, slot 2 the ASMedia SATA
+  controller for drive bay 3, with PERST# on misc GPIO 18 and 20, active
+  low, as in the vendor DT.
+- SATA: the QTS model.conf puts drive bays 1 and 2 on the SoC SATA
+  ports 0 and 1. Use the 573 mV TX amplitude of the QTS kernel for this
+  board family. The drive power is not switched by the SoC, so the
+  reference-design "gpios" of the vendor SATA node are not described.
+- USB: the three DWC3 controllers in host mode, with the PHY tuning of
+  the vendor DT. The VBUS switches on ISO GPIO 1 (DRD port) and ISO
+  GPIO 32 (USB 3.0 host) are always-on fixed regulators. The vendor
+  "u2host-power-gpio" (ISO GPIO 31) doubles as the LAN speed LED of the
+  vendor Ethernet driver on this board and is left alone. The EHCI/OHCI
+  pair needs the RLE0599 PHY, which has no mainline driver.
+- LAN2 is the SoC GMAC; the boot loader programs its MAC address.
+- Front panel, from the QTS model.conf of this board and its HAL: the
+  Weltrend MCU on UART2 (kept as serial2, like ttyS2 under QTS) with
+  the QTS fan duties of 25%, 50% and 100% as cooling levels, the reset
+  and USB copy buttons on ISO GPIO 25 and 33 (active low), and the
+  drive bay 1 and 2 LEDs on SoC PWM 0 and 3 (active low). QTS runs the
+  fan from the MCU board temperature and the drive temperatures in
+  userspace; two active trips on the CPU zone are a floor that works
+  without it.
+- Audio: the audio CPU RPC with a 128 MiB heap for the firmware's own
+  allocations (the vendor kernel serves them from its ~200 MiB media
+  heap, and the firmware crashes when one fails) and a 1 MiB no-map
+  pool for the PCM buffers, both taken from the vendor audio carveout
+  below the audio CPU's 512 MiB limit, and the speaker amplifier on
+  MISC GPIO 100, active high.
+- Power-off: the MCU cuts the power only once the SoC is in standby,
+  as under QTS ("@C0", then the audio CPU's coolboot standby). Enable
+  the audio CPU power-off with the vendor wakeup GPIO (ISO GPIO 23,
+  active high), and restart if the audio CPU does not take over, since
+  U-Boot then finds the MCU in its shutdown state and powers the board
+  down itself.
+---
+ arch/arm64/boot/dts/realtek/Makefile          |   1 +
+ .../boot/dts/realtek/rtd1296-qnap-ts328.dts   | 661 ++++++++++++++++++
+ 2 files changed, 662 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/realtek/rtd1296-qnap-ts328.dts
+
+diff --git a/arch/arm64/boot/dts/realtek/Makefile b/arch/arm64/boot/dts/realtek/Makefile
+index ef8d8fcba..afcb010ed 100644
+--- a/arch/arm64/boot/dts/realtek/Makefile
++++ b/arch/arm64/boot/dts/realtek/Makefile
+@@ -8,6 +8,7 @@ dtb-$(CONFIG_ARCH_REALTEK) += rtd1295-xnano-x5.dtb
+ dtb-$(CONFIG_ARCH_REALTEK) += rtd1295-zidoo-x9s.dtb
+ 
+ dtb-$(CONFIG_ARCH_REALTEK) += rtd1296-ds418.dtb
++dtb-$(CONFIG_ARCH_REALTEK) += rtd1296-qnap-ts328.dtb
+ 
+ dtb-$(CONFIG_ARCH_REALTEK) += rtd1395-bpi-m4.dtb
+ dtb-$(CONFIG_ARCH_REALTEK) += rtd1395-lionskin.dtb
+diff --git a/arch/arm64/boot/dts/realtek/rtd1296-qnap-ts328.dts b/arch/arm64/boot/dts/realtek/rtd1296-qnap-ts328.dts
+new file mode 100644
+index 000000000..db0d757b8
+--- /dev/null
++++ b/arch/arm64/boot/dts/realtek/rtd1296-qnap-ts328.dts
+@@ -0,0 +1,661 @@
++// SPDX-License-Identifier: (GPL-2.0-or-later OR BSD-2-Clause)
++/*
++ * QNAP TS-328 (Realtek RTD1296, 2 GiB)
++ *
++ * Memory reservations follow the vendor DT (rtd-1296-2GB-MM-xa28a): U-Boot
++ * starts the audio CPU (bluecore.audio at 0x1b00000) and the vendor media
++ * blocks, which keep using these regions after the kernel starts.
++ */
++
++/dts-v1/;
++
++/memreserve/ 0x00000000 0x00030000;	/* boot ROM area, RPC comm at 0x1f000 */
++/memreserve/ 0x01b00000 0x00400000;	/* audio firmware */
++/memreserve/ 0x02c00000 0x0d400000;	/* vendor media/audio carveout */
++/* vendor audio carveout, minus acpu_heap and audio_pool (0x17000000-0x1f100000) */
++/memreserve/ 0x11000000 0x06000000;
++/memreserve/ 0x1f100000 0x00b00000;
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/leds/common.h>
++#include <dt-bindings/thermal/thermal.h>
++
++#include "rtd1296.dtsi"
++
++/ {
++	compatible = "qnap,ts-328", "realtek,rtd1296";
++	model = "QNAP TS-328";
++
++	memory@1f000 {
++		device_type = "memory";
++		reg = <0x1f000 0x7ffe1000>; /* boot ROM to 2 GiB */
++	};
++
++	aliases {
++		i2c0 = &i2c_0;
++		i2c4 = &i2c_4;
++		mmc0 = &emmc;
++		rtc0 = &rx8010;
++		serial0 = &uart0;
++		serial2 = &uart2;	/* MCU, ttyS2 as in QTS */
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++	};
++
++	/*
++	 * Front buttons, from the QTS model.conf of this board
++	 * (RESET_BUTTON = GPIO:I7E:P, USB_COPY_BUTTON = GPIO:I86:P): vendor
++	 * GPIO 0x7e and 0x86, i.e. ISO GPIO 25 and 33 (the ISO lines start at
++	 * 101). "P" makes the QTS HAL invert the line, so they are active low.
++	 * The power button is read through the MCU (qnap-mcu-input).
++	 */
++	keys {
++		compatible = "gpio-keys";
++		pinctrl-names = "default";
++		pinctrl-0 = <&key_pins>;
++
++		key-copy {
++			label = "copy";
++			gpios = <&iso_gpio 33 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_COPY>;
++		};
++
++		key-reset {
++			label = "reset";
++			gpios = <&iso_gpio 25 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_RESTART>;
++		};
++	};
++
++	/*
++	 * Drive bay 1 and 2 LEDs on SoC PWM 0 and 3 (QTS model.conf:
++	 * PRESENT_LED = PWM:C0:L0 and PWM:C0:L3). QTS sets 0% duty for on
++	 * and 100% for off, so they are active low. Bay 3 has no
++	 * SoC-controlled LED. The red error LEDs are driven by the MCU.
++	 */
++	leds {
++		compatible = "pwm-leds";
++
++		led-0 {
++			color = <LED_COLOR_ID_GREEN>;
++			function = LED_FUNCTION_DISK;
++			function-enumerator = <1>;
++			pwms = <&pwm 0 1000000>;
++			active-low;
++			max-brightness = <255>;
++		};
++
++		led-1 {
++			color = <LED_COLOR_ID_GREEN>;
++			function = LED_FUNCTION_DISK;
++			function-enumerator = <2>;
++			pwms = <&pwm 3 1000000>;
++			active-low;
++			max-brightness = <255>;
++		};
++	};
++
++	reserved-memory {
++		/*
++		 * Same layout as the vendor kernel (ramoops.mem_address=0x2F000000
++		 * mem_size=0x200000 console_size=0x100000, 4 KiB records), so either
++		 * kernel can read the other's console log after a warm reset.
++		 */
++		ramoops@2f000000 {
++			compatible = "ramoops";
++			reg = <0x2f000000 0x200000>;
++			record-size = <0x1000>;
++			console-size = <0x100000>;
++		};
++
++		pcie1_area: pcie1@2f200000 {
++			reg = <0x2f200000 0x20>;
++		};
++
++		/*
++		 * Memory the audio CPU firmware asks for at run time (the
++		 * vendor ION media heap, about 200 MiB). The firmware takes
++		 * about 16.5 MiB at boot (audio and video agents) and crashes
++		 * if a request fails. The audio CPU reaches only the first
++		 * 512 MiB.
++		 */
++		acpu_heap: acpu-heap@17000000 {
++			reg = <0x17000000 0x8000000>;
++			no-map;
++		};
++
++		/* PCM buffer and ring headers shared with the audio CPU */
++		audio_pool: audio-pool@1f000000 {
++			compatible = "shared-dma-pool";
++			reg = <0x1f000000 0x100000>;
++			no-map;
++		};
++	};
++
++	/*
++	 * Speaker: the audio CPU firmware drives the SoC DAC, the amplifier
++	 * is enabled by MISC GPIO 100 (vendor "[AUDIO] Mute Off (gpio 100)",
++	 * driven high).
++	 */
++	sound {
++		compatible = "realtek,rtd1295-acpu-audio";
++		memory-region = <&audio_pool>;
++		realtek,rpc = <&acpu_rpc>;
++		enable-gpios = <&misc_gpio 100 GPIO_ACTIVE_HIGH>;
++	};
++
++	/*
++	 * USB VBUS switch enables, active high, driven high by the vendor
++	 * kernel ("type_c-power-gpio" ISO 1 for the DRD port, and
++	 * "u3host-power-gpio" ISO 32 for the USB 3.0 host). The vendor
++	 * "u2host-power-gpio" (ISO 31) is not described: on this board the
++	 * vendor Ethernet driver also uses it as the LAN speed LED.
++	 */
++	vbus_drd: regulator-usb-drd-vbus {
++		compatible = "regulator-fixed";
++		regulator-name = "usb-drd-vbus";
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		gpio = <&iso_gpio 1 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-always-on;
++		regulator-boot-on;
++	};
++
++	vbus_u3host: regulator-usb-u3host-vbus {
++		compatible = "regulator-fixed";
++		regulator-name = "usb-u3host-vbus";
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		gpio = <&iso_gpio 32 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-always-on;
++		regulator-boot-on;
++	};
++
++	/*
++	 * The "frequency-table,rev1" and "voltage-table" of the vendor DT
++	 * (dvfs node, chip revision A01 = 0x00010000), the same as the
++	 * Realtek BSP 4.9 OPPs. The L2 rail follows through the regulator
++	 * coupling. The maximum of 1.1 V lets the coupler step the CPU
++	 * rail down in stages while the L2 rail comes down.
++	 */
++	cpu_opp_table: opp-table-cpu {
++		compatible = "operating-points-v2";
++		opp-shared;
++
++		opp-300000000 {
++			opp-hz = /bits/ 64 <300000000>;
++			opp-microvolt = <800000 800000 1100000>;
++			clock-latency-ns = <150000>;
++		};
++
++		opp-400000000 {
++			opp-hz = /bits/ 64 <400000000>;
++			opp-microvolt = <800000 800000 1100000>;
++			clock-latency-ns = <150000>;
++		};
++
++		opp-500000000 {
++			opp-hz = /bits/ 64 <500000000>;
++			opp-microvolt = <800000 800000 1100000>;
++			clock-latency-ns = <150000>;
++		};
++
++		opp-600000000 {
++			opp-hz = /bits/ 64 <600000000>;
++			opp-microvolt = <825000 825000 1100000>;
++			clock-latency-ns = <150000>;
++		};
++
++		opp-700000000 {
++			opp-hz = /bits/ 64 <700000000>;
++			opp-microvolt = <850000 850000 1100000>;
++			clock-latency-ns = <150000>;
++		};
++
++		opp-800000000 {
++			opp-hz = /bits/ 64 <800000000>;
++			opp-microvolt = <875000 875000 1100000>;
++			clock-latency-ns = <150000>;
++		};
++
++		opp-900000000 {
++			opp-hz = /bits/ 64 <900000000>;
++			opp-microvolt = <900000 900000 1100000>;
++			clock-latency-ns = <150000>;
++		};
++
++		opp-1000000000 {
++			opp-hz = /bits/ 64 <1000000000>;
++			opp-microvolt = <925000 925000 1100000>;
++			clock-latency-ns = <150000>;
++		};
++
++		opp-1100000000 {
++			opp-hz = /bits/ 64 <1100000000>;
++			opp-microvolt = <962500 962500 1100000>;
++			clock-latency-ns = <150000>;
++		};
++
++		opp-1200000000 {
++			opp-hz = /bits/ 64 <1200000000>;
++			opp-microvolt = <1012500 1012500 1100000>;
++			clock-latency-ns = <150000>;
++		};
++
++		opp-1300000000 {
++			opp-hz = /bits/ 64 <1300000000>;
++			opp-microvolt = <1062500 1062500 1100000>;
++			clock-latency-ns = <150000>;
++		};
++
++		opp-1400000000 {
++			opp-hz = /bits/ 64 <1400000000>;
++			opp-microvolt = <1100000 1100000 1100000>;
++			clock-latency-ns = <150000>;
++			/*
++			 * Used for system suspend only. cpufreq is not stopped
++			 * on reboot or power-off; there the G2227 driver
++			 * raises the rails back to the boot loader voltage and
++			 * keeps them there.
++			 */
++			opp-suspend;
++		};
++	};
++};
++
++&uart0 {
++	status = "okay";
++};
++
++/*
++ * U-Boot parks CPUs 1-3 on SB2 register 0x9801aa44 (the vendor kernel's
++ * "rtk-spin-table"). The firmware only implements PSCI 0.1, without CPU_ON.
++ */
++&cpu0 {
++	enable-method = "realtek,rtd1295-spin-table";
++	cpu-release-addr = /bits/ 64 <0x9801aa44>;
++	clocks = <&scpu_pll>;
++	cpu-supply = <&vdd_cpu>;
++	operating-points-v2 = <&cpu_opp_table>;
++	#cooling-cells = <2>;
++};
++
++&cpu1 {
++	enable-method = "realtek,rtd1295-spin-table";
++	cpu-release-addr = /bits/ 64 <0x9801aa44>;
++	clocks = <&scpu_pll>;
++	cpu-supply = <&vdd_cpu>;
++	operating-points-v2 = <&cpu_opp_table>;
++	#cooling-cells = <2>;
++};
++
++&cpu2 {
++	enable-method = "realtek,rtd1295-spin-table";
++	cpu-release-addr = /bits/ 64 <0x9801aa44>;
++	clocks = <&scpu_pll>;
++	cpu-supply = <&vdd_cpu>;
++	operating-points-v2 = <&cpu_opp_table>;
++	#cooling-cells = <2>;
++};
++
++&cpu3 {
++	enable-method = "realtek,rtd1295-spin-table";
++	cpu-release-addr = /bits/ 64 <0x9801aa44>;
++	clocks = <&scpu_pll>;
++	cpu-supply = <&vdd_cpu>;
++	operating-points-v2 = <&cpu_opp_table>;
++	#cooling-cells = <2>;
++};
++
++/*
++ * Interim pin muxing until there is a RTD1295 pinctrl driver. The vendor
++ * kernel muxes the I2C0 and I2C4 pads from its pinctrl hog; nothing shows
++ * the boot loader does it, and without it the RX8010 does not ACK. The mux
++ * fields are 2 bits wide; the values match the vendor kernel's registers.
++ */
++&iso {
++	iso_pinmux: pinmux@310 {
++		compatible = "pinctrl-single";
++		reg = <0x310 0x4>;
++		#pinctrl-cells = <2>;
++		pinctrl-single,bit-per-mux;
++		pinctrl-single,register-width = <32>;
++		pinctrl-single,function-mask = <0x3>;
++
++		/* i2c_scl_0 [23:22], i2c_sda_0 [25:24] = 1 (i2c0) */
++		i2c0_pins: i2c0-pins {
++			pinctrl-single,bits = <0x0 0x01400000 0x03c00000>;
++		};
++
++		/* iso_gpio_4 [1:0], iso_gpio_5 [3:2] = 1 (uart2_0) */
++		uart2_iso45_pins: uart2-iso45-pins {
++			pinctrl-single,bits = <0x0 0x5 0xf>;
++		};
++	};
++
++	/*
++	 * Same as the vendor pinctrl hog. The 3-bit iso_gpio_2/3 fields
++	 * are split into 2-bit chunks by pinctrl-single.
++	 */
++	iso_pinmux_314: pinmux@314 {
++		compatible = "pinctrl-single";
++		reg = <0x314 0x4>;
++		#pinctrl-cells = <2>;
++		pinctrl-single,bit-per-mux;
++		pinctrl-single,register-width = <32>;
++		pinctrl-single,function-mask = <0x3>;
++
++		/*
++		 * iso_gpio_2 [8:6], iso_gpio_3 [11:9] = 4 (uart2_0),
++		 * ur2_loc [31:30] = 1 (UART2 on iso_gpio_2..5)
++		 */
++		uart2_iso23_pins: uart2-iso23-pins {
++			pinctrl-single,bits = <0x0 0x40000900 0xc0000fc0>;
++		};
++	};
++
++	iso_pinmux_31c: pinmux@31c {
++		compatible = "pinctrl-single";
++		reg = <0x31c 0x4>;
++		#pinctrl-cells = <2>;
++		pinctrl-single,bit-per-mux;
++		pinctrl-single,register-width = <32>;
++		pinctrl-single,function-mask = <0x3>;
++
++		/* iso_gpio_21 [1:0], iso_gpio_24 [7:6] = 1 (pwm0, pwm3) */
++		pwm_pins: pwm-pins {
++			pinctrl-single,bits = <0x0 0x41 0xc3>;
++		};
++
++		/* iso_gpio_25 [9:8], iso_gpio_33 [11:10] = 0 (gpio) */
++		key_pins: key-pins {
++			pinctrl-single,bits = <0x0 0x0 0xf00>;
++		};
++	};
++};
++
++&sb2 {
++	sb2_pinmux: pinmux@90c {
++		compatible = "pinctrl-single";
++		reg = <0x90c 0x4>;
++		#pinctrl-cells = <2>;
++		pinctrl-single,bit-per-mux;
++		pinctrl-single,register-width = <32>;
++		pinctrl-single,function-mask = <0x3>;
++
++		/* i2c_sda_4 [5:4], i2c_scl_4 [7:6] = 1 (i2c4) */
++		i2c4_pins: i2c4-pins {
++			pinctrl-single,bits = <0x0 0x50 0xf0>;
++		};
++	};
++};
++
++/*
++ * 4 GB eMMC with U-Boot's boot files and the Debian root. The pads stay as
++ * U-Boot muxed them (it boots from here). Read-only until the read tests
++ * pass: boot with dw_mmc_rtd129x.allow_writes=1, or drop realtek,read-only,
++ * to allow writes.
++ */
++&emmc {
++	bus-width = <8>;
++	cap-mmc-highspeed;
++	max-frequency = <50000000>;
++	/* vendor DT pddrive_nf_s0, used above 26 MHz */
++	realtek,drive-hs = <0x77 0x77 0x77 0x33>;
++	non-removable;
++	no-sd;
++	no-sdio;
++	realtek,read-only;
++	status = "okay";
++};
++
++&i2c_0 {
++	clock-frequency = <100000>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&i2c0_pins>;
++	status = "okay";
++
++	/*
++	 * GMT G2227 PMIC. Only the CPU and L2 rails are described: the
++	 * other rails keep the voltages set by the boot loader. The ranges
++	 * are those of the vendor voltage tables.
++	 *
++	 * The vendor cpufreq driver sets the L2 rail to 0.9 V up to a CPU
++	 * voltage of 1.0 V, 0.95 V up to 1.05 V and 1.0 V above (the BSP
++	 * 4.9 rule). Coupling the rails with a 100 mV maximum spread gives
++	 * the same pairs, as LDO3 has 0.9, 0.95 and 1.0 V steps.
++	 */
++	pmic@12 {
++		compatible = "gmt,g2227";
++		reg = <0x12>;
++
++		regulators {
++			vdd_cpu: dcdc2 {
++				regulator-name = "vdd_cpu";
++				regulator-min-microvolt = <800000>;
++				regulator-max-microvolt = <1100000>;
++				regulator-always-on;
++				regulator-boot-on;
++				regulator-coupled-with = <&vdd_l2>;
++				regulator-coupled-max-spread = <100000>;
++			};
++
++			vdd_l2: ldo3 {
++				regulator-name = "vdd_l2";
++				regulator-min-microvolt = <900000>;
++				regulator-max-microvolt = <1000000>;
++				regulator-always-on;
++				regulator-boot-on;
++				regulator-coupled-with = <&vdd_cpu>;
++				regulator-coupled-max-spread = <100000>;
++			};
++		};
++	};
++};
++
++&i2c_4 {
++	clock-frequency = <100000>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&i2c4_pins>;
++	status = "okay";
++
++	/* System RTC as in the vendor kernel, which disables the SoC RTC */
++	rx8010: rtc@32 {
++		compatible = "epson,rx8010";
++		reg = <0x32>;
++	};
++};
++
++/*
++ * Slot 1: Realtek RTL8111/8168 (LAN1). Slot 2: ASMedia ASM106x SATA
++ * controller for drive bay 3, Gen2 as in the vendor DT ("speed-mode").
++ * PERST# is misc GPIO 18 (slot 1) and 20 (slot 2), active low, as in the
++ * vendor DT; the boot loader leaves both driven high (deasserted).
++ */
++&pcie1 {
++	reset-gpios = <&misc_gpio 18 GPIO_ACTIVE_LOW>;
++	status = "okay";
++};
++
++&pcie2 {
++	reset-gpios = <&misc_gpio 20 GPIO_ACTIVE_LOW>;
++	status = "okay";
++};
++
++/*
++ * Drive bays, from the QTS model.conf of this board ([System Disk 1..3]):
++ * bay 1 is SoC SATA port 0, bay 2 SoC SATA port 1 (DEV_BUS
++ * 9803f000.sata, DEV_PORT 0/1), bay 3 is port 1 of the ASMedia AHCI on
++ * PCIe slot 2 (DEV_DOMAIN 1, B01:D00:F0, DEV_PORT 1).
++ *
++ * The drive power is not switched by the SoC: QTS has no disk power
++ * control entries for this model, the vendor kernel is built without the
++ * ahci_rtk GPIO code, and the vendor board DT keeps ISO GPIO 15 an input.
++ * The "gpios" of the vendor SATA node (misc GPIO 56, ISO GPIO 15) come
++ * from the Realtek reference DT and are left alone.
++ */
++&sata {
++	status = "okay";
++};
++
++/* QTS for the TS-x28A boards sets the Gen1-3 TX amplitude to 573 mV */
++&sata_phy {
++	realtek,tx-amplitude-microvolt = <573000>;
++	status = "okay";
++};
++
++/*
++ * USB: the three DWC3 controllers in host mode. The PHY tuning follows the
++ * vendor DT: USB2 driving level 8 on the DRD port and 6 on the two host
++ * ports, USB3 amplitude 0x24/0x284a on the USB 3.0 host. Which connector
++ * sits on which controller is not confirmed yet; under the vendor kernel a
++ * USB stick in a rear port enumerated on the USB 3.0 host (981f0000).
++ * The EHCI/OHCI pair at 0x98013000 needs the RLE0599 PHY, which has no
++ * mainline driver, so it is not described.
++ */
++&usb_drd {
++	status = "okay";
++};
++
++&usb_drd_dwc3 {
++	dr_mode = "host";
++};
++
++&usb2phy_drd {
++	status = "okay";
++};
++
++&usb3phy_drd {
++	status = "okay";
++};
++
++&usb_u2host {
++	status = "okay";
++};
++
++&usb2phy_u2host {
++	realtek,driving-level = <6>;
++	status = "okay";
++};
++
++&usb_u3host {
++	status = "okay";
++};
++
++&usb2phy_u3host {
++	realtek,driving-level = <6>;
++	status = "okay";
++};
++
++&usb3phy_u3host {
++	realtek,amplitude-control-coarse-tuning = <0x24>;
++	realtek,amplitude-control-fine-tuning = <0x284a>;
++	status = "okay";
++};
++
++/*
++ * LAN2: SoC GMAC. The boot loader programs the board MAC address into the
++ * MAC0 registers, where the driver picks it up. The vendor DT also lists
++ * ISO GPIO 31 ("iso-gpios"), which the QNAP vendor driver toggles as a
++ * link speed LED; it is not described here.
++ */
++&gmac {
++	status = "okay";
++};
++
++&pwm {
++	pinctrl-names = "default";
++	pinctrl-0 = <&pwm_pins>;
++	status = "okay";
++};
++
++/*
++ * Weltrend WT61P803 front-panel MCU on UART2 (QTS: MCU_DEV = /dev/ttyS2,
++ * MCU_SPEC = SPEC4, 115200 8N1). It switches the board power, the status,
++ * USB and drive error LEDs, the buzzer and the fan, and reports the power
++ * button and a board temperature.
++ */
++&uart2 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&uart2_iso23_pins>, <&uart2_iso45_pins>;
++	status = "okay";
++
++	mcu {
++		compatible = "qnap,ts328-mcu";
++
++		/* QTS fan duties 25%, 50% and 100% */
++		fan: fan-0 {
++			#cooling-cells = <2>;
++			cooling-levels = <64 128 255>;
++		};
++	};
++};
++
++/*
++ * QTS controls the fan from the MCU board temperature and the drive
++ * temperatures, in userspace. These SoC trips are a floor that keeps
++ * working without that: 25% below the first trip, then 50% and 100%.
++ */
++&cpu_thermal {
++	trips {
++		cpu_fan_mid: cpu-fan-mid {
++			temperature = <60000>;
++			hysteresis = <5000>;
++			type = "active";
++		};
++
++		cpu_fan_high: cpu-fan-high {
++			temperature = <75000>;
++			hysteresis = <5000>;
++			type = "active";
++		};
++	};
++
++	cooling-maps {
++		map-fan-mid {
++			trip = <&cpu_fan_mid>;
++			cooling-device = <&fan 1 1>;
++		};
++
++		map-fan-high {
++			trip = <&cpu_fan_high>;
++			cooling-device = <&fan 2 2>;
++		};
++
++		map-cpufreq {
++			trip = <&cpu_alert>;
++			cooling-device =
++				<&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++				<&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++				<&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++				<&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++		};
++	};
++};
++
++/*
++ * The MCU cuts the power only once the SoC is in standby, as QTS does it:
++ * "@C0" to the MCU, then the vendor kernel enters the audio CPU's
++ * "coolboot" standby. ISO GPIO 23 is the vendor wakeup GPIO (active high).
++ */
++&acpu_rpc {
++	memory-region = <&rpc_ringbuf>, <&rpc_comm>, <&acpu_heap>;
++	status = "okay";
++};
++
++&acpu_poweroff {
++	realtek,wakeup-iso-lines = <23>;
++	/*
++	 * Hardware test: when the ACPU did not take over, the panic reboot
++	 * still switched the board off, because U-Boot found the MCU in its
++	 * shutdown state ("device was in shutdown stat ... power down s5").
++	 * Do that restart on purpose instead of waiting into a panic.
++	 */
++	realtek,restart-on-failure;
++	status = "okay";
++};

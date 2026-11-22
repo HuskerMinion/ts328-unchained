@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# /etc/default/qnap-voice
+# VOICE=no disables the prompts.
+VOICE=yes
+# Firmware master volume 0..31 (31 = full). Empty: leave it alone.
+VOLUME=

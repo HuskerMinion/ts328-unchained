@@ -1,0 +1,217 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# qnap-mcu - talk to the QNAP TS-328 front-panel MCU (Weltrend WT61P803)
+#
+# Protocol (QTS "MCU_SPEC = SPEC4", see docs/HARDWARE.md):
+#   /dev/ttyS2 (SoC UART2), 115200 8N1, no flow control.
+#   A command is ASCII (e.g. "@C3") plus one checksum byte, the XOR of all
+#   command bytes. Replies carry the same checksum. "@0" + checksum is
+#   the ACK for set commands.
+#
+# Two modes:
+#   - The kernel driver (qnap-mcu, compatible "qnap,ts328-mcu") owns UART2.
+#     Then /dev/ttyS2 does not exist and this tool uses sysfs (LEDs, hwmon).
+#     Raw commands are not possible in that mode.
+#   - No kernel driver (MCU node disabled): this tool talks to /dev/ttyS2
+#     directly.
+#
+# Usage: qnap-mcu <command> [args]
+#   version                 MCU firmware version ("%V")
+#   beep [short|long]       buzzer ("@C3" / "@C2", which is which: unverified)
+#   status <mode>           status LED: off green red green-blink red-blink
+#                           green-slow red-slow both both-blink
+#   usb <off|on|blink>      front USB LED
+#   err <1-3> <off|on|blink|fast>   drive error LED (red)
+#   fan <0-255>             fan PWM (0 = stop, QTS minimum is 50)
+#   fan                     show fan PWM and speed
+#   temp                    MCU board temperature
+#   poweroff                arm the MCU power cut ("@C0"). The MCU cuts the
+#                           power only once the SoC is in ACPU standby, which
+#                           the kernel enters on poweroff (rtd1295-acpu-poweroff)
+#   raw <ascii> [byte...] [-r <len>]
+#                           send a raw command; <len> = reply length
+#                           without the checksum byte (default 2)
+
+set -u
+
+DEV=${QNAP_MCU_DEV:-/dev/ttyS2}
+TMP=${TMPDIR:-/tmp}
+
+die() { echo "qnap-mcu: $*" >&2; exit 1; }
+
+have_driver() { [ -d /sys/bus/serial/drivers/qnap-mcu ] && ls /sys/bus/serial/drivers/qnap-mcu | grep -q serial; }
+
+hwmon_dir() {
+	for d in /sys/class/hwmon/hwmon*; do
+		[ "$(cat "$d/name" 2>/dev/null)" = qnapmcu ] && { echo "$d"; return 0; }
+	done
+	return 1
+}
+
+led() { # led <name> <0|1> [trigger timer on/off ms]
+	l=/sys/class/leds/$1
+	[ -d "$l" ] || die "no LED $1"
+	echo none > "$l/trigger"
+	echo "$2" > "$l/brightness"
+	if [ $# -ge 4 ]; then
+		echo timer > "$l/trigger"
+		echo "$3" > "$l/delay_on"
+		echo "$4" > "$l/delay_off"
+	fi
+}
+
+# raw_cmd <reply_len> <ascii> [byte...]
+raw_cmd() {
+	rlen=$1; shift
+	ascii=$1; shift
+	[ -c "$DEV" ] || die "$DEV missing (kernel driver bound?)"
+
+	cs=0; esc=""
+	s=$ascii
+	while [ -n "$s" ]; do
+		c=${s%"${s#?}"}; s=${s#?}
+		v=$(printf '%d' "'$c")
+		cs=$((cs ^ v)); esc="$esc$(printf '\\%03o' "$v")"
+	done
+	for b in "$@"; do
+		v=$((b & 255))
+		cs=$((cs ^ v)); esc="$esc$(printf '\\%03o' "$v")"
+	done
+	esc="$esc$(printf '\\%03o' "$cs")"
+
+	exec 3<>"$DEV" || die "cannot open $DEV"
+	stty -F "$DEV" 115200 cs8 -cstopb -parenb -crtscts clocal raw -echo \
+		min 0 time 10 || die "stty failed"
+	out=$(mktemp "$TMP/qnap-mcu.XXXXXX")
+	n=$((rlen + 1))
+	dd bs=1 count="$n" <&3 > "$out" 2>/dev/null &
+	rd=$!
+	# shellcheck disable=SC2059
+	printf "$esc" >&3
+	wait "$rd"
+	exec 3>&-
+	od -An -tx1 -v "$out" | tr -s ' ' | sed 's/^ //'
+	got=$(wc -c < "$out")
+	rm -f "$out"
+	[ "$got" -eq "$n" ] || { echo "qnap-mcu: short reply ($got of $n bytes)" >&2; return 1; }
+}
+
+ack() { r=$(raw_cmd 2 "$@") || return 1; [ "${r%% *}" = 40 ] && [ "$(echo "$r" | cut -d' ' -f2)" = 30 ] || { echo "qnap-mcu: no ACK: $r" >&2; return 1; }; }
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+version)
+	have_driver && { dmesg | grep -i 'qnap-mcu' | tail -n 3; exit 0; }
+	raw_cmd 6 "%V"
+	;;
+beep)
+	have_driver && die "use the input device (EV_SND), e.g. 'beep -e /dev/input/by-path/platform-*qnap-mcu-input*-event'"
+	case "${1:-short}" in
+	short) ack "@C3" ;;
+	long) ack "@C2" ;;
+	*) die "beep short|long" ;;
+	esac
+	;;
+status)
+	if have_driver; then
+		case "${1:-}" in
+		off) led green:status 0; led red:status 0 ;;
+		green) led red:status 0; led green:status 1 ;;
+		red) led green:status 0; led red:status 1 ;;
+		green-blink) led red:status 0; led green:status 1 500 500 ;;
+		red-blink) led green:status 0; led red:status 1 500 500 ;;
+		green-slow) led red:status 0; led green:status 1 1000 1000 ;;
+		red-slow) led green:status 0; led red:status 1 1000 1000 ;;
+		both) led green:status 1; led red:status 1 ;;
+		both-blink) led green:status 1 500 500; led red:status 1 500 500 ;;
+		*) die "status off|green|red|green-blink|red-blink|green-slow|red-slow|both|both-blink" ;;
+		esac
+	else
+		# Encoding as in the mainline leds-qnap-mcu driver
+		case "${1:-}" in
+		off) c=9 ;; green) c=6 ;; red) c=7 ;; green-blink) c=5 ;;
+		red-blink) c=4 ;; green-slow) c=A ;; red-slow) c=B ;;
+		both) c=D ;; both-blink) c=8 ;;
+		*) die "status off|green|red|green-blink|red-blink|green-slow|red-slow|both|both-blink" ;;
+		esac
+		ack "@C$c"
+	fi
+	;;
+usb)
+	if have_driver; then
+		case "${1:-}" in
+		off) led usb:blue:disk 0 ;; on) led usb:blue:disk 1 ;;
+		blink) led usb:blue:disk 1 250 250 ;;
+		*) die "usb off|on|blink" ;;
+		esac
+	else
+		case "${1:-}" in
+		on) c=E ;; blink) c=F ;; off) c=G ;;
+		*) die "usb off|on|blink" ;;
+		esac
+		ack "@C$c"
+	fi
+	;;
+err)
+	n=${1:-}; m=${2:-}
+	case "$n" in 1|2|3) ;; *) die "err 1-3 off|on|blink|fast" ;; esac
+	if have_driver; then
+		case "$m" in
+		off) led "hdd$n:red:status" 0 ;; on) led "hdd$n:red:status" 1 ;;
+		blink) led "hdd$n:red:status" 1 500 500 ;;
+		fast) led "hdd$n:red:status" 1 100 100 ;;
+		*) die "err 1-3 off|on|blink|fast" ;;
+		esac
+	else
+		case "$m" in on) v=0 ;; off) v=1 ;; fast) v=2 ;; blink) v=3 ;;
+		*) die "err 1-3 off|on|blink|fast" ;; esac
+		ack "@R$((n - 1))$v"
+	fi
+	;;
+fan)
+	if [ $# -eq 0 ]; then
+		if d=$(hwmon_dir); then
+			echo "pwm $(cat "$d/pwm1") rpm $(cat "$d/fan1_input")"
+		else
+			echo "pwm (@FZ0): $(raw_cmd 4 "@FZ0")"
+			echo "rpm (@FA):  $(raw_cmd 6 "@FA")"
+		fi
+		exit 0
+	fi
+	v=$1
+	[ "$v" -ge 0 ] 2>/dev/null && [ "$v" -le 255 ] || die "fan 0-255"
+	if d=$(hwmon_dir); then
+		echo "$v" > "$d/pwm1"
+	else
+		ack "@FW0" "$v"
+	fi
+	;;
+temp)
+	if d=$(hwmon_dir); then
+		echo "$(( $(cat "$d/temp1_input") / 1000 )) C"
+	else
+		raw_cmd 4 "@T3"
+	fi
+	;;
+poweroff)
+	have_driver && die "the kernel driver powers off; use 'systemctl poweroff'"
+	sync
+	ack "@C0"
+	;;
+raw)
+	[ $# -ge 1 ] || die "raw <ascii> [byte...] [-r len]"
+	a=$1; shift
+	len=2; bytes=""
+	while [ $# -gt 0 ]; do
+		if [ "$1" = -r ]; then len=$2; shift 2; else bytes="$bytes $1"; shift; fi
+	done
+	# shellcheck disable=SC2086
+	raw_cmd "$len" "$a" $bytes
+	;;
+*)
+	sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
+	exit 1
+	;;
+esac

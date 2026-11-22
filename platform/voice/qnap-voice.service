@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=QNAP TS-328 spoken boot and shutdown prompts
+Documentation=file:/usr/local/share/qnap-voice/README
+# Start after the boot is complete. Stopping runs in reverse order, so the
+# "Shutting down" prompt plays early, while sound and filesystems are up.
+After=multi-user.target sound.target local-fs.target alsa-restore.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/local/sbin/qnap-voice boot
+ExecStop=-/usr/local/sbin/qnap-voice shutdown
+TimeoutStartSec=20
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

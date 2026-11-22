@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Match]
+Path=platform-98016000.*
+
+[Link]
+Name=lan2

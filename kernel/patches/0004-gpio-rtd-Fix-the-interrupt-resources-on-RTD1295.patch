@@ -1,0 +1,69 @@
+From 93d0c03f8d67e4c50bbd557d3973bf416c77a3af Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 04/40] gpio: rtd: Fix the interrupt resources on RTD1295
+
+The second register region of the GPIO controller holds the GPIO
+interrupt status registers. On RTD1295 these sit in the ISO and MISC
+blocks (ISO 0x08/0x0c/0xe0/0xe4, MISC 0x40-0xbc), interleaved with
+registers of other devices: the ISO/MISC interrupt mux at offset 0 and,
+in the ISO block, the reset controller at 0x88. The reset controller
+claims its register, so devm_platform_ioremap_resource() on a region
+covering it fails with -EBUSY and the ISO GPIO controller cannot probe.
+Map the interrupt status region with devm_ioremap() instead. The driver
+only touches its own GPIO bits in these registers.
+
+The irq_chip is also immutable but lacks irq_request_resources and
+irq_release_resources, so GPIOs requested as interrupts are never
+marked as used for IRQ, and gpiochip_enable_irq() warns when a consumer
+such as gpio-keys enables the interrupt:
+
+  WARNING: ... at drivers/gpio/gpiolib.c:4121 gpiochip_enable_irq+0x70/0x78
+
+Add GPIOCHIP_IRQ_RESOURCE_HELPERS, as other immutable GPIO irq_chips do.
+---
+ drivers/gpio/gpio-rtd.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpio/gpio-rtd.c b/drivers/gpio/gpio-rtd.c
+index d46b40dd5..3fe72dae6 100644
+--- a/drivers/gpio/gpio-rtd.c
++++ b/drivers/gpio/gpio-rtd.c
+@@ -520,6 +520,7 @@ static const struct irq_chip rtd_gpio_irq_chip = {
+ 	.irq_disable = rtd_gpio_disable_irq,
+ 	.irq_set_type = rtd_gpio_irq_set_type,
+ 	.flags = IRQCHIP_IMMUTABLE,
++	GPIOCHIP_IRQ_RESOURCE_HELPERS,
+ };
+ 
+ static int rtd_gpio_probe(struct platform_device *pdev)
+@@ -527,6 +528,7 @@ static int rtd_gpio_probe(struct platform_device *pdev)
+ 	struct device *dev = &pdev->dev;
+ 	struct gpio_irq_chip *irq_chip;
+ 	struct rtd_gpio *data;
++	struct resource *res;
+ 	int ret;
+ 
+ 	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+@@ -553,9 +555,18 @@ static int rtd_gpio_probe(struct platform_device *pdev)
+ 	if (IS_ERR(data->base))
+ 		return PTR_ERR(data->base);
+ 
+-	data->irq_base = devm_platform_ioremap_resource(pdev, 1);
+-	if (IS_ERR(data->irq_base))
+-		return PTR_ERR(data->irq_base);
++	/*
++	 * The interrupt status registers live in the ISO/MISC block next to
++	 * registers of other devices (interrupt mux, reset controller), so
++	 * map them without claiming the region exclusively.
++	 */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (!res)
++		return -EINVAL;
++
++	data->irq_base = devm_ioremap(dev, res->start, resource_size(res));
++	if (!data->irq_base)
++		return -ENOMEM;
+ 
+ 	data->gpio_chip.label = dev_name(dev);
+ 	data->gpio_chip.base = -1;

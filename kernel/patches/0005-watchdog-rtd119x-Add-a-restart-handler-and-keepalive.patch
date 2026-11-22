@@ -1,0 +1,84 @@
+From dced12ac8454b666c9cb47a9027765515d625678 Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 05/40] watchdog: rtd119x: Add a restart handler and keepalive
+ support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implement the restart callback so that the watchdog can reset the
+machine when no other restart handler (such as PSCI SYSTEM_RESET, which
+has a higher priority) is available or succeeds. It programs a short
+overflow of 0x800000 ticks (about 0.3 s at 27 MHz) and enables the
+watchdog, the same sequence as Andreas Färber's out-of-tree "Implement
+watchdog-based machine restart" patch and the Realtek BSP
+rtd129x_restart.c, but through the watchdog core restart handler
+instead of arm_pm_restart.
+
+The driver also implements ping and set_timeout but reports no options,
+so the watchdog core rejects WDIOC_KEEPALIVE and WDIOC_SETTIMEOUT with
+-EOPNOTSUPP. A daemon such as systemd (RuntimeWatchdogSec) then starts
+the watchdog but cannot feed it, and the board resets when the
+programmed timeout expires. Advertise WDIOF_KEEPALIVEPING,
+WDIOF_SETTIMEOUT and WDIOF_MAGICCLOSE.
+---
+ drivers/watchdog/rtd119x_wdt.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/watchdog/rtd119x_wdt.c b/drivers/watchdog/rtd119x_wdt.c
+index 0bfadb589..3d9214b17 100644
+--- a/drivers/watchdog/rtd119x_wdt.c
++++ b/drivers/watchdog/rtd119x_wdt.c
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/bitops.h>
+ #include <linux/clk.h>
++#include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -24,6 +25,8 @@
+ 
+ #define RTD119X_TCWTR_WDCLR			BIT(0)
+ 
++#define RTD119X_RESTART_TIMEOUT			0x800000
++
+ struct rtd119x_watchdog_device {
+ 	struct watchdog_device wdt_dev;
+ 	void __iomem *base;
+@@ -76,17 +79,33 @@ static int rtd119x_wdt_set_timeout(struct watchdog_device *wdev, unsigned int va
+ 	return 0;
+ }
+ 
++static int rtd119x_wdt_restart(struct watchdog_device *wdev,
++			       unsigned long action, void *data)
++{
++	struct rtd119x_watchdog_device *wdt = watchdog_get_drvdata(wdev);
++
++	/* Expire after about 0.3 s (2^23 ticks of the 27 MHz clock) */
++	writel_relaxed(RTD119X_TCWTR_WDCLR, wdt->base + RTD119X_TCWTR);
++	writel(RTD119X_RESTART_TIMEOUT, wdt->base + RTD119X_TCWOV);
++	writel(RTD119X_TCWCR_WDEN_ENABLED, wdt->base + RTD119X_TCWCR);
++
++	mdelay(1000);
++
++	return 0;
++}
++
+ static const struct watchdog_ops rtd119x_wdt_ops = {
+ 	.owner = THIS_MODULE,
+ 	.start		= rtd119x_wdt_start,
+ 	.stop		= rtd119x_wdt_stop,
+ 	.ping		= rtd119x_wdt_ping,
+ 	.set_timeout	= rtd119x_wdt_set_timeout,
++	.restart	= rtd119x_wdt_restart,
+ };
+ 
+ static const struct watchdog_info rtd119x_wdt_info = {
+ 	.identity = "rtd119x-wdt",
+-	.options = 0,
++	.options = WDIOF_KEEPALIVEPING | WDIOF_SETTIMEOUT | WDIOF_MAGICCLOSE,
+ };
+ 
+ static const struct of_device_id rtd119x_wdt_dt_ids[] = {

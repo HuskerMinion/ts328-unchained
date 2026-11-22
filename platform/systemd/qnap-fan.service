@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=QNAP TS-328 fan control (board and drive temperatures)
+ConditionPathExists=/sys/bus/serial/drivers/qnap-mcu
+
+[Service]
+ExecStart=/usr/local/sbin/qnap-fan
+Restart=on-failure
+# If this stops, leave the fan at full speed
+ExecStopPost=/bin/sh -c 'for d in /sys/class/hwmon/hwmon*; do [ "$(cat $d/name)" = qnapmcu ] && echo 255 > $d/pwm1; done; true'
+
+[Install]
+WantedBy=multi-user.target

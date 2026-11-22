@@ -1,0 +1,25 @@
+From 644c2425ba1ee316ccfe5a2857d2c0c875f4da1e Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 21/40] dt-bindings: mfd: qnap,ts433-mcu: Add the TS-328
+ compatible
+
+The QNAP TS-328 (Realtek RTD1296) has a Weltrend MCU on UART2 that
+speaks the same protocol as the TS-233/TS-433 MCU (QTS "MCU_SPEC =
+SPEC4"). It handles three drive bays.
+---
+ Documentation/devicetree/bindings/mfd/qnap,ts433-mcu.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Documentation/devicetree/bindings/mfd/qnap,ts433-mcu.yaml b/Documentation/devicetree/bindings/mfd/qnap,ts433-mcu.yaml
+index 5454d9403..497d7d20d 100644
+--- a/Documentation/devicetree/bindings/mfd/qnap,ts433-mcu.yaml
++++ b/Documentation/devicetree/bindings/mfd/qnap,ts433-mcu.yaml
+@@ -17,6 +17,7 @@ properties:
+   compatible:
+     enum:
+       - qnap,ts233-mcu
++      - qnap,ts328-mcu
+       - qnap,ts433-mcu
+ 
+   nvmem-layout:

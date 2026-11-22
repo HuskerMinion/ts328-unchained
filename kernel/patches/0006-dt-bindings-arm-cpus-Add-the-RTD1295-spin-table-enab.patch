@@ -1,0 +1,36 @@
+From 1c99b94858a41763beb45b2cc8bfecc2b08aa696 Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 06/40] dt-bindings: arm: cpus: Add the RTD1295 spin-table
+ enable method
+
+The boot loader of Realtek RTD129x SoCs parks the secondary CPUs on a
+32-bit MMIO register (SB2 0x9801aa44 on RTD1295/RTD1296) rather than on
+a 64-bit release location in normal memory as the spin-table method
+requires. Add an enable-method for this variant; like spin-table it
+requires cpu-release-addr.
+---
+ Documentation/devicetree/bindings/arm/cpus.yaml | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/arm/cpus.yaml b/Documentation/devicetree/bindings/arm/cpus.yaml
+index 736b7ab1b..3c055717b 100644
+--- a/Documentation/devicetree/bindings/arm/cpus.yaml
++++ b/Documentation/devicetree/bindings/arm/cpus.yaml
+@@ -230,6 +230,8 @@ properties:
+       - enum:
+           - psci
+           - spin-table
++          # spin-table with a 32-bit MMIO release register
++          - realtek,rtd1295-spin-table
+       # On ARM 32-bit systems this property is optional
+       - enum:
+           - actions,s500-smp
+@@ -462,6 +464,7 @@ allOf:
+         enable-method:
+           enum:
+             - spin-table
++            - realtek,rtd1295-spin-table
+             - renesas,r9a06g032-smp
+       required:
+         - enable-method

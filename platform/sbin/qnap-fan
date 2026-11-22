@@ -1,0 +1,69 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# qnap-fan - fan control for the QNAP TS-328, after the QTS "TFAN" settings
+#
+# QTS (hal_util_QZ461_QZ650_12_10.conf) controls the fan in userspace from
+# the MCU board ("SYS") temperature and the drive temperatures:
+#   [TFAN SYS]  TFAN_NORMAL_MODE = 40:45:50, duties 25% / 50% / 100%
+#   [TFAN DISK] TFAN_NORMAL_MODE = 47:52
+# The exact QTS state machine is not known. This is an approximation:
+#   board < 45 C and drives < 47 C   -> 25%  (64)
+#   board < 50 C and drives < 52 C   -> 50%  (128)
+#   otherwise                        -> 100% (255)
+# with 2 C of hysteresis on the way down. It never goes below the level
+# the kernel thermal zone (SoC temperature) asks for, and it falls back to
+# full speed if no temperature can be read.
+#
+# Needs the kernel qnap-mcu driver (hwmon "qnapmcu") and, for drive
+# temperatures, CONFIG_SENSORS_DRIVETEMP (hwmon "drivetemp").
+
+set -u
+INTERVAL=${QNAP_FAN_INTERVAL:-10}
+LEVELS="64 128 255"
+
+hwmon_by_name() {
+	for d in /sys/class/hwmon/hwmon*; do
+		[ "$(cat "$d/name" 2>/dev/null)" = "$1" ] && echo "$d"
+	done
+}
+
+level_pwm() { i=$1; set -- $LEVELS; shift "$i"; echo "$1"; } # index -> pwm
+
+kernel_floor() {
+	for c in /sys/class/thermal/cooling_device*; do
+		[ "$(cat "$c/type" 2>/dev/null)" = qnap-mcu-hwmon ] && { cat "$c/cur_state"; return; }
+	done
+	echo 0
+}
+
+mcu=$(hwmon_by_name qnapmcu | head -n 1)
+[ -n "$mcu" ] || { echo "qnap-fan: no qnapmcu hwmon device" >&2; exit 1; }
+
+state=2
+while :; do
+	sys=$(cat "$mcu/temp1_input" 2>/dev/null) || sys=""
+	disk=0
+	for d in $(hwmon_by_name drivetemp); do
+		t=$(cat "$d/temp1_input" 2>/dev/null) || continue
+		[ "$t" -gt "$disk" ] && disk=$t
+	done
+
+	if [ -z "$sys" ]; then
+		want=2
+	else
+		sys=$((sys / 1000)); disk=$((disk / 1000))
+		h=0; [ "$state" -ge 1 ] && h=2
+		want=0
+		{ [ "$sys" -ge $((45 - h)) ] || [ "$disk" -ge $((47 - h)) ]; } && want=1
+		h=0; [ "$state" -ge 2 ] && h=2
+		{ [ "$sys" -ge $((50 - h)) ] || [ "$disk" -ge $((52 - h)) ]; } && want=2
+	fi
+
+	k=$(kernel_floor)
+	[ "$k" -gt "$want" ] && want=$k
+	if [ "$want" != "$state" ] || [ "$(cat "$mcu/pwm1")" != "$(level_pwm "$want")" ]; then
+		level_pwm "$want" > "$mcu/pwm1"
+		state=$want
+	fi
+	sleep "$INTERVAL"
+done

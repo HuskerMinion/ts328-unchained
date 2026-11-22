@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=QNAP TS-328 front panel status LED
+After=multi-user.target
+ConditionPathExists=/sys/class/leds/green:status
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Booted: solid green, like QTS
+ExecStart=/usr/local/sbin/qnap-mcu status green
+ExecStart=-/usr/local/sbin/qnap-mcu usb off
+# Shutting down: blink green
+ExecStop=/usr/local/sbin/qnap-mcu status green-blink
+
+[Install]
+WantedBy=multi-user.target

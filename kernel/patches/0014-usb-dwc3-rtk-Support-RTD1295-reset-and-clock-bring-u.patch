@@ -1,0 +1,196 @@
+From 1cc47c3910d097516fbf22cbc5b4467e5a95fc2b Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 14/40] usb: dwc3: rtk: Support RTD1295 reset and clock
+ bring-up
+
+On RTD1295 the USB PHY, USB3 PHY MDIO and common USB resets in the CRT
+block may still be asserted when the kernel starts; the vendor kernel
+releases them from a separate power manager driver before any
+controller probes. The common USB clock gate (CRT 0x0c bit 4) is only
+enabled when the boot loader used USB itself. After a plain eMMC boot
+it is off and all controllers fail with "this is not a DesignWare USB3
+DRD Core".
+
+Get the optional resets of the glue node by index and follow the
+vendor sequence: release the PHY resets, pulse the clock, release the
+MDIO and MAC resets with the clock off, then enable the clock. Wait
+2 ms after each reset that was actually asserted, as the vendor code
+does after the PHY resets. The resets are shared, because every
+controller lists the common lines, and the sequence runs under a lock
+so that only the first controller that finds the MAC in reset does
+it. Refuse to enable the gate when the MAC is already out of reset
+with the clock off, since switching the clock on in that state hung
+the bus.
+---
+ drivers/usb/dwc3/dwc3-rtk.c | 138 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 138 insertions(+)
+
+diff --git a/drivers/usb/dwc3/dwc3-rtk.c b/drivers/usb/dwc3/dwc3-rtk.c
+index 56c53e0c0..fa18c6af6 100644
+--- a/drivers/usb/dwc3/dwc3-rtk.c
++++ b/drivers/usb/dwc3/dwc3-rtk.c
+@@ -7,11 +7,15 @@
+  */
+ 
+ #include <linux/cleanup.h>
++#include <linux/delay.h>
++#include <linux/mfd/syscon.h>
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/platform_device.h>
++#include <linux/regmap.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
++#include <linux/reset.h>
+ #include <linux/suspend.h>
+ #include <linux/sys_soc.h>
+ #include <linux/usb/otg.h>
+@@ -268,6 +272,136 @@ static int dwc3_rtk_init(struct dwc3_rtk *rtk)
+ 	return 0;
+ }
+ 
++static void dwc3_rtk_reset_assert(void *data)
++{
++	reset_control_assert(data);
++}
++
++#define DWC3_RTK_MAX_RESETS	16
++
++static DEFINE_MUTEX(dwc3_rtk_reset_lock);
++
++static int dwc3_rtk_deassert_one(struct dwc3_rtk *rtk, struct reset_control *rstc,
++				 bool asserted, int i)
++{
++	int ret;
++
++	ret = reset_control_deassert(rstc);
++	if (ret)
++		return dev_err_probe(rtk->dev, ret, "failed to deassert reset %d\n", i);
++
++	ret = devm_add_action_or_reset(rtk->dev, dwc3_rtk_reset_assert, rstc);
++	if (ret)
++		return ret;
++
++	if (asserted)
++		usleep_range(2000, 3000);
++
++	return 0;
++}
++
++/*
++ * The wrapper, PHY and MAC resets live in the CRT block and may still be
++ * asserted when the kernel starts. Release them in the order listed in the
++ * DT before the wrapper is touched, waiting after every reset that was
++ * actually asserted. The resets are shared because several controllers list
++ * the same lines.
++ *
++ * On RTD1295 the common USB clock gate is in the CRT block as well, and the
++ * boot loader only enables it when it used USB itself. The vendor sequence
++ * releases the PHY resets, pulses the clock (on, off), releases the MDIO and
++ * MAC resets with the clock off and only then enables the clock. Follow
++ * that order; enabling the gate in any other state is refused, as a bus
++ * hang was seen when the clock was switched on outside this sequence.
++ * "realtek,usb-clock" = <&crt offset bit count> describes the gate and the
++ * number of leading (PHY) resets released before the pulse.
++ */
++static int dwc3_rtk_deassert_resets(struct dwc3_rtk *rtk)
++{
++	struct device *dev = rtk->dev;
++	struct reset_control *rstc[DWC3_RTK_MAX_RESETS];
++	bool asserted[DWC3_RTK_MAX_RESETS];
++	struct regmap *crt = NULL;
++	u32 args[3] = { 0, 0, 0 };
++	bool mac_asserted = false;
++	unsigned int val;
++	int i, num, split, ret;
++
++	num = of_count_phandle_with_args(dev->of_node, "resets", "#reset-cells");
++	if (num <= 0)
++		return 0;
++	if (num > DWC3_RTK_MAX_RESETS)
++		return dev_err_probe(dev, -EINVAL, "too many resets\n");
++
++	if (of_property_present(dev->of_node, "realtek,usb-clock")) {
++		crt = syscon_regmap_lookup_by_phandle_args(dev->of_node,
++							   "realtek,usb-clock",
++							   3, args);
++		if (IS_ERR(crt))
++			return dev_err_probe(dev, PTR_ERR(crt),
++					     "failed to get the USB clock gate\n");
++		if (args[1] > 31 || args[2] > num)
++			return dev_err_probe(dev, -EINVAL,
++					     "invalid realtek,usb-clock\n");
++	}
++	split = crt ? args[2] : num;
++
++	for (i = 0; i < num; i++) {
++		rstc[i] = devm_reset_control_get_shared_by_index(dev, i);
++		if (IS_ERR(rstc[i]))
++			return dev_err_probe(dev, PTR_ERR(rstc[i]),
++					     "failed to get reset %d\n", i);
++	}
++
++	guard(mutex)(&dwc3_rtk_reset_lock);
++
++	for (i = 0; i < num; i++) {
++		asserted[i] = reset_control_status(rstc[i]) > 0;
++		if (i >= split && asserted[i])
++			mac_asserted = true;
++	}
++
++	for (i = 0; i < split; i++) {
++		ret = dwc3_rtk_deassert_one(rtk, rstc[i], asserted[i], i);
++		if (ret)
++			return ret;
++	}
++
++	if (crt && !mac_asserted) {
++		ret = regmap_read(crt, args[0], &val);
++		if (ret)
++			return ret;
++		if (!(val & BIT(args[1])))
++			return dev_err_probe(dev, -EIO,
++					     "USB clock off with the MAC out of reset\n");
++	}
++
++	if (crt && mac_asserted) {
++		regmap_set_bits(crt, args[0], BIT(args[1]));
++		regmap_clear_bits(crt, args[0], BIT(args[1]));
++		usleep_range(1000, 2000);
++	}
++
++	for (i = split; i < num; i++) {
++		ret = dwc3_rtk_deassert_one(rtk, rstc[i], asserted[i], i);
++		if (ret)
++			return ret;
++	}
++
++	if (crt) {
++		ret = regmap_read(crt, args[0], &val);
++		if (ret)
++			return ret;
++		if (!(val & BIT(args[1]))) {
++			regmap_set_bits(crt, args[0], BIT(args[1]));
++			usleep_range(2000, 3000);
++			dev_dbg(dev, "enabled the USB clock\n");
++		}
++	}
++
++	return 0;
++}
++
+ static int dwc3_rtk_probe_dwc3_core(struct dwc3_rtk *rtk)
+ {
+ 	struct device *dev = rtk->dev;
+@@ -277,6 +411,10 @@ static int dwc3_rtk_probe_dwc3_core(struct dwc3_rtk *rtk)
+ 	enum usb_dr_mode dr_mode;
+ 	int ret = 0;
+ 
++	ret = dwc3_rtk_deassert_resets(rtk);
++	if (ret)
++		return ret;
++
+ 	ret = dwc3_rtk_init(rtk);
+ 	if (ret)
+ 		return -EINVAL;

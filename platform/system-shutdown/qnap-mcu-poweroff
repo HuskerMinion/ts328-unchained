@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# /usr/lib/systemd/system-shutdown/qnap-mcu-poweroff
+#
+# systemd-shutdown runs this right before the final reboot() call, with
+# all filesystems unmounted or read-only. $1 is "poweroff", "reboot",
+# "halt" or "kexec".
+#
+# With the kernel qnap-mcu driver bound (normal case) the kernel sends the
+# power-off command itself, so nothing is done here. Without the driver
+# (MCU node disabled in the DT) send "@C0" to the MCU on /dev/ttyS2.
+# That only arms the MCU: it cuts the board power once the SoC is in the
+# audio-CPU standby, which the kernel enters right after this hook
+# (rtd1295-acpu-poweroff), the same order as QTS.
+
+[ "$1" = poweroff ] || exit 0
+[ -c /dev/ttyS2 ] || exit 0
+[ -d /sys/bus/serial/drivers/qnap-mcu ] && \
+	ls /sys/bus/serial/drivers/qnap-mcu | grep -q serial && exit 0
+
+exec /usr/local/sbin/qnap-mcu poweroff

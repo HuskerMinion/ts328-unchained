@@ -1,0 +1,41 @@
+QNAP TS-328 voice prompts
+=========================
+
+What plays when:
+
+- "Boot complete": once multi-user.target is reached (qnap-voice.service ExecStart).
+- "Shutting down": at the start of every shutdown, reboot or poweroff
+  (qnap-voice.service ExecStop). The unit is ordered after multi-user, sound,
+  local-fs and alsa-restore, so it is stopped before all of them.
+- "Powering down": on poweroff only. It plays from the systemd-shutdown hook
+  qnap-voice-poweroff, the last userspace step before reboot(2). The kernel shuts
+  the sound card down only after that.
+- "RAID sync complete" and the RAID warning: from /usr/local/sbin/md-event,
+  when mdadm runs it as its PROGRAM (see docs/INSTALL.md).
+
+If there is no "RTD1295" ALSA card, the MCU buzzer is used instead:
+
+1. the qnap-mcu input device (EV_SND)
+2. otherwise /usr/local/sbin/qnap-mcu
+
+Install on the NAS: `sh install.sh` (needs alsa-utils).
+Settings: /etc/default/qnap-voice.
+
+The prompts were rendered with Piper using the en_US-joe-medium voice and sox
+(see render-prompts-piper.sh for the text and the exact settings):
+
+    TTS_DIR=<dir with venv/bin/piper and voices/en_US-joe-medium.onnx> ./render-prompts-piper.sh [outdir]
+
+Output: WAV, S16_LE, stereo, 48 kHz, with 0.2 s of silence in front and 0.6 s
+behind. Piper's output varies slightly from run to run, so a new render is not
+byte-identical to the shipped files.
+
+Credits: Piper (https://github.com/OHF-Voice/piper1-gpl, GPL-3.0-or-later),
+voice en_US-joe-medium, trained on the CC0 "joe" dataset and fine-tuned from
+the CC0 "rdh" base model. The generated audio is distributed under the
+project license.
+
+Manual test:
+
+    qnap-voice test
+    aplay -D plughw:CARD=RTD1295 /usr/local/share/qnap-voice/test-tone-1k.wav

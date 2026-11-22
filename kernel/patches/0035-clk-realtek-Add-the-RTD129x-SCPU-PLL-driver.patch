@@ -1,0 +1,492 @@
+From c27bd19bb25f18cbe69755a1aa5e33320f231644 Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 35/40] clk: realtek: Add the RTD129x SCPU PLL driver
+
+Expose the SCPU PLL as a clock so that cpufreq-dt can scale the CPU
+frequency. The rate is 27 MHz * (NCODE + 3 + FCODE / 2048), divided by
+1, 2 or 4 (CRT PLL_DIV scpu_freq_sel).
+
+The sequence follows the vendor kernels (QNAP 4.2.8 clk-rtd129x.c,
+Realtek BSP 4.9 clk-pll.c): NCODE/FCODE are written with OC_EN clear,
+then OC_EN is set and the driver waits for OC_DONE, and 100 us more as
+QNAP does. The divider is switched to or from /1 only while the PLL is
+at 1 GHz (the vendor glitch workaround), and otherwise before or after
+the PLL change so that the output never goes above the old or new rate.
+
+Only the NCODE/FCODE pairs of the BSP frequency table are programmed,
+and the output is limited to the vendor maximum of 1.4 GHz. If OC_EN is
+clear at probe, the output rate is not known and the driver does not
+register the clock. None of the vendor clock code takes the RTD129x
+RBUS lock, so this driver does not either.
+---
+ drivers/clk/Kconfig                    |   1 +
+ drivers/clk/Makefile                   |   1 +
+ drivers/clk/realtek/Kconfig            |  12 +
+ drivers/clk/realtek/Makefile           |   2 +
+ drivers/clk/realtek/clk-rtd129x-scpu.c | 404 +++++++++++++++++++++++++
+ 5 files changed, 420 insertions(+)
+ create mode 100644 drivers/clk/realtek/Kconfig
+ create mode 100644 drivers/clk/realtek/Makefile
+ create mode 100644 drivers/clk/realtek/clk-rtd129x-scpu.c
+
+diff --git a/drivers/clk/Kconfig b/drivers/clk/Kconfig
+index 3a1611008..2f2cacf87 100644
+--- a/drivers/clk/Kconfig
++++ b/drivers/clk/Kconfig
+@@ -530,6 +530,7 @@ source "drivers/clk/nuvoton/Kconfig"
+ source "drivers/clk/pistachio/Kconfig"
+ source "drivers/clk/qcom/Kconfig"
+ source "drivers/clk/ralink/Kconfig"
++source "drivers/clk/realtek/Kconfig"
+ source "drivers/clk/renesas/Kconfig"
+ source "drivers/clk/rockchip/Kconfig"
+ source "drivers/clk/samsung/Kconfig"
+diff --git a/drivers/clk/Makefile b/drivers/clk/Makefile
+index 61ec08404..a4ea8174a 100644
+--- a/drivers/clk/Makefile
++++ b/drivers/clk/Makefile
+@@ -141,6 +141,7 @@ obj-$(CONFIG_COMMON_CLK_PISTACHIO)	+= pistachio/
+ obj-$(CONFIG_COMMON_CLK_PXA)		+= pxa/
+ obj-$(CONFIG_COMMON_CLK_QCOM)		+= qcom/
+ obj-y					+= ralink/
++obj-y					+= realtek/
+ obj-y					+= renesas/
+ obj-$(CONFIG_ARCH_ROCKCHIP)		+= rockchip/
+ obj-$(CONFIG_COMMON_CLK_SAMSUNG)	+= samsung/
+diff --git a/drivers/clk/realtek/Kconfig b/drivers/clk/realtek/Kconfig
+new file mode 100644
+index 000000000..df355f877
+--- /dev/null
++++ b/drivers/clk/realtek/Kconfig
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++config COMMON_CLK_RTD129X_SCPU
++	tristate "Realtek RTD129x SCPU PLL"
++	depends on ARCH_REALTEK || COMPILE_TEST
++	depends on OF
++	select MFD_SYSCON
++	default ARCH_REALTEK
++	help
++	  Support for the PLL that clocks the Cortex-A53 cluster of the
++	  Realtek RTD1293, RTD1295 and RTD1296 SoCs, so that the CPU
++	  frequency can be scaled (cpufreq-dt).
+diff --git a/drivers/clk/realtek/Makefile b/drivers/clk/realtek/Makefile
+new file mode 100644
+index 000000000..9e2c5fdf0
+--- /dev/null
++++ b/drivers/clk/realtek/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_COMMON_CLK_RTD129X_SCPU)	+= clk-rtd129x-scpu.o
+diff --git a/drivers/clk/realtek/clk-rtd129x-scpu.c b/drivers/clk/realtek/clk-rtd129x-scpu.c
+new file mode 100644
+index 000000000..4bff5ff5b
+--- /dev/null
++++ b/drivers/clk/realtek/clk-rtd129x-scpu.c
+@@ -0,0 +1,404 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Realtek RTD129x SCPU (Cortex-A53 cluster) PLL
++ *
++ * Based on the SCPU PLL code of the Realtek vendor kernels (QNAP 4.2.8
++ * clk-rtd129x.c, Realtek BSP 4.9 clk-pll.c, by Cheng-Yu Lee), which are
++ * Copyright (C) 2016, Realtek Semiconductor Corporation
++ * Copyright (C) 2017 Realtek Semiconductor Corporation
++ * Copyright (C) 2017 Cheng-Yu Lee <cylee12@realtek.com>
++ *
++ * The PLL runs at 27 MHz * (NCODE + 3 + FCODE / 2048) and is followed by
++ * the scpu_freq_sel divider in CRT PLL_DIV (1: /1, 2: /2, 3: /4; the
++ * vendor code reads 0 as /1). NCODE/FCODE are changed in "OC" mode: the
++ * PLL slews to the new code and sets OC_DONE when it gets there.
++ *
++ * Only the PLL settings of the vendor frequency table are programmed.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk-provider.h>
++#include <linux/delay.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++
++/* CRT offsets */
++#define RTD1295_PLL_DIV			0x030
++#define  RTD1295_PLL_DIV_SCPU		GENMASK(8, 7)
++
++/* Offsets in the PLL_SSC_DIG_SCPU block */
++#define SSC_DIG_SCPU0			0x00
++#define  SSC_DIG_SCPU0_OC_EN		BIT(0)
++#define  SSC_DIG_SCPU0_EN_SSC		BIT(1)
++#define SSC_DIG_SCPU1			0x04
++#define  SSC_DIG_SCPU1_NCODE		GENMASK(18, 11)
++#define  SSC_DIG_SCPU1_FCODE		GENMASK(10, 0)
++#define SSC_DIG_SCPU_DBG2		0x1c
++#define  SSC_DIG_SCPU_DBG2_OC_DONE	BIT(20)
++
++#define SCPU_FCODE_DEN			2048
++#define SCPU_OC_DONE_TIMEOUT_US		20000
++/* QNAP 4.2.8 waits this long after OC_DONE */
++#define SCPU_OC_SETTLE_US		100
++
++/* PLL rate used while the output divider is switched to or from 1 */
++#define SCPU_DIV_SWITCH_RATE		1000000000UL
++/* Vendor frequency table maximum (QNAP 4.2.8 DT, Realtek BSP 4.9 OPPs) */
++#define SCPU_MAX_RATE			1400000000UL
++
++struct rtd129x_scpu_pll_cfg {
++	unsigned long rate;
++	unsigned int ncode;
++	unsigned int fcode;
++};
++
++/* The NCODE/FCODE pairs of the Realtek BSP 4.9 scpu_tbl */
++static const struct rtd129x_scpu_pll_cfg rtd129x_scpu_pll_cfgs[] = {
++	{ 1000000000, 34,   75 },
++	{ 1100000000, 37, 1517 },
++	{ 1200000000, 41,  910 },
++	{ 1300000000, 45,  303 },
++	{ 1400000000, 48, 1745 },
++	{ 1600000000, 56,  531 },
++	{ 1800000000, 63, 1365 },
++};
++
++/* Output divider: used for rates >= min_rate, in this order */
++static const struct {
++	unsigned long min_rate;
++	unsigned int div;
++	unsigned int sel;
++} rtd129x_scpu_divs[] = {
++	{ 1000000000, 1, 1 },
++	{  500000000, 2, 2 },
++	{  250000000, 4, 3 },
++};
++
++struct rtd129x_scpu_pll {
++	struct clk_hw hw;
++	struct device *dev;
++	struct regmap *regmap;	/* CRT */
++	unsigned int base;	/* PLL_SSC_DIG_SCPU in CRT */
++};
++
++#define to_scpu_pll(_hw) container_of(_hw, struct rtd129x_scpu_pll, hw)
++
++static unsigned int rtd129x_scpu_sel_to_div(unsigned int sel)
++{
++	return sel == 3 ? 4 : sel == 2 ? 2 : 1;
++}
++
++static const struct rtd129x_scpu_pll_cfg *
++rtd129x_scpu_find_cfg(unsigned long pll_rate)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(rtd129x_scpu_pll_cfgs); i++)
++		if (rtd129x_scpu_pll_cfgs[i].rate == pll_rate)
++			return &rtd129x_scpu_pll_cfgs[i];
++
++	return NULL;
++}
++
++/* Returns the divider table index for an output rate, or -EINVAL */
++static int rtd129x_scpu_find_div(unsigned long rate)
++{
++	int i;
++
++	if (rate > SCPU_MAX_RATE)
++		return -EINVAL;
++
++	for (i = 0; i < ARRAY_SIZE(rtd129x_scpu_divs); i++)
++		if (rate >= rtd129x_scpu_divs[i].min_rate)
++			return i;
++
++	return -EINVAL;
++}
++
++/* Highest supported output rate at or below @rate, or 0 */
++static unsigned long rtd129x_scpu_round(unsigned long rate)
++{
++	unsigned long best = 0;
++	int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(rtd129x_scpu_divs); i++) {
++		for (j = 0; j < ARRAY_SIZE(rtd129x_scpu_pll_cfgs); j++) {
++			unsigned long out = rtd129x_scpu_pll_cfgs[j].rate /
++					    rtd129x_scpu_divs[i].div;
++
++			if (out > rate || out <= best)
++				continue;
++			if (rtd129x_scpu_find_div(out) != i)
++				continue;
++			best = out;
++		}
++	}
++
++	return best;
++}
++
++static int rtd129x_scpu_read(struct rtd129x_scpu_pll *pll, unsigned int *ncode,
++			     unsigned int *fcode, unsigned int *sel)
++{
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(pll->regmap, pll->base + SSC_DIG_SCPU1, &val);
++	if (ret)
++		return ret;
++	*ncode = FIELD_GET(SSC_DIG_SCPU1_NCODE, val);
++	*fcode = FIELD_GET(SSC_DIG_SCPU1_FCODE, val);
++
++	ret = regmap_read(pll->regmap, RTD1295_PLL_DIV, &val);
++	if (ret)
++		return ret;
++	*sel = FIELD_GET(RTD1295_PLL_DIV_SCPU, val);
++
++	return 0;
++}
++
++static unsigned long rtd129x_scpu_pll_rate(unsigned int ncode,
++					   unsigned int fcode,
++					   unsigned long parent_rate)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(rtd129x_scpu_pll_cfgs); i++)
++		if (rtd129x_scpu_pll_cfgs[i].ncode == ncode &&
++		    rtd129x_scpu_pll_cfgs[i].fcode == fcode)
++			return rtd129x_scpu_pll_cfgs[i].rate;
++
++	return (ncode + 3) * parent_rate +
++	       div_u64((u64)parent_rate * fcode, SCPU_FCODE_DEN);
++}
++
++static unsigned long rtd129x_scpu_recalc_rate(struct clk_hw *hw,
++					      unsigned long parent_rate)
++{
++	struct rtd129x_scpu_pll *pll = to_scpu_pll(hw);
++	unsigned int ncode, fcode, sel;
++
++	if (rtd129x_scpu_read(pll, &ncode, &fcode, &sel))
++		return 0;
++
++	return rtd129x_scpu_pll_rate(ncode, fcode, parent_rate) /
++	       rtd129x_scpu_sel_to_div(sel);
++}
++
++static int rtd129x_scpu_determine_rate(struct clk_hw *hw,
++				       struct clk_rate_request *req)
++{
++	unsigned long rate = rtd129x_scpu_round(req->rate);
++
++	if (!rate)
++		return -EINVAL;
++
++	req->rate = rate;
++	return 0;
++}
++
++static int rtd129x_scpu_write_sel(struct rtd129x_scpu_pll *pll,
++				  unsigned int sel)
++{
++	return regmap_update_bits(pll->regmap, RTD1295_PLL_DIV,
++				  RTD1295_PLL_DIV_SCPU,
++				  FIELD_PREP(RTD1295_PLL_DIV_SCPU, sel));
++}
++
++/* Slew the PLL to @cfg in OC mode and wait for it to get there */
++static int rtd129x_scpu_write_pll(struct rtd129x_scpu_pll *pll,
++				  const struct rtd129x_scpu_pll_cfg *cfg)
++{
++	unsigned int ctl = pll->base + SSC_DIG_SCPU0;
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(pll->regmap, pll->base + SSC_DIG_SCPU1, &val);
++	if (ret)
++		return ret;
++	if (FIELD_GET(SSC_DIG_SCPU1_NCODE, val) == cfg->ncode &&
++	    FIELD_GET(SSC_DIG_SCPU1_FCODE, val) == cfg->fcode)
++		return 0;
++
++	ret = regmap_clear_bits(pll->regmap, ctl, SSC_DIG_SCPU0_OC_EN);
++	if (ret)
++		return ret;
++
++	ret = regmap_update_bits(pll->regmap, pll->base + SSC_DIG_SCPU1,
++				 SSC_DIG_SCPU1_NCODE | SSC_DIG_SCPU1_FCODE,
++				 FIELD_PREP(SSC_DIG_SCPU1_NCODE, cfg->ncode) |
++				 FIELD_PREP(SSC_DIG_SCPU1_FCODE, cfg->fcode));
++	if (ret)
++		return ret;
++
++	ret = regmap_set_bits(pll->regmap, ctl, SSC_DIG_SCPU0_OC_EN);
++	if (ret)
++		return ret;
++
++	ret = regmap_read_poll_timeout_atomic(pll->regmap,
++					      pll->base + SSC_DIG_SCPU_DBG2,
++					      val,
++					      val & SSC_DIG_SCPU_DBG2_OC_DONE,
++					      1, SCPU_OC_DONE_TIMEOUT_US);
++	if (ret) {
++		dev_err(pll->dev, "PLL did not reach %lu Hz: %d\n",
++			cfg->rate, ret);
++		return ret;
++	}
++
++	udelay(SCPU_OC_SETTLE_US);
++
++	return 0;
++}
++
++static int rtd129x_scpu_set_rate(struct clk_hw *hw, unsigned long rate,
++				 unsigned long parent_rate)
++{
++	struct rtd129x_scpu_pll *pll = to_scpu_pll(hw);
++	const struct rtd129x_scpu_pll_cfg *cfg, *switch_cfg;
++	unsigned int ncode, fcode, cur_sel, cur_div, new_sel, new_div;
++	int idx, ret;
++
++	idx = rtd129x_scpu_find_div(rate);
++	if (idx < 0)
++		return idx;
++
++	new_sel = rtd129x_scpu_divs[idx].sel;
++	new_div = rtd129x_scpu_divs[idx].div;
++	cfg = rtd129x_scpu_find_cfg(rate * new_div);
++	if (!cfg)
++		return -EINVAL;
++
++	ret = rtd129x_scpu_read(pll, &ncode, &fcode, &cur_sel);
++	if (ret)
++		return ret;
++	cur_div = rtd129x_scpu_sel_to_div(cur_sel);
++
++	/*
++	 * The vendor code works around an output glitch: the divider is
++	 * only switched to or from /1 while the PLL is at 1 GHz. Coming
++	 * from /1 with the PLL already below that (not a vendor setting),
++	 * raising it first would overshoot, so switch right away.
++	 */
++	if (new_sel != cur_sel && (new_div == 1 || cur_div == 1)) {
++		if (cur_div > 1 ||
++		    rtd129x_scpu_pll_rate(ncode, fcode, parent_rate) >
++		    SCPU_DIV_SWITCH_RATE) {
++			switch_cfg = rtd129x_scpu_find_cfg(SCPU_DIV_SWITCH_RATE);
++
++			ret = rtd129x_scpu_write_pll(pll, switch_cfg);
++			if (ret)
++				return ret;
++		}
++
++		ret = rtd129x_scpu_write_sel(pll, new_sel);
++		if (ret)
++			return ret;
++
++		cur_div = new_div;
++	}
++
++	/* Switch the divider so that the output never overshoots */
++	if (new_div > cur_div) {
++		ret = rtd129x_scpu_write_sel(pll, new_sel);
++		if (ret)
++			return ret;
++	}
++
++	ret = rtd129x_scpu_write_pll(pll, cfg);
++	if (ret)
++		return ret;
++
++	if (new_div < cur_div)
++		ret = rtd129x_scpu_write_sel(pll, new_sel);
++
++	return ret;
++}
++
++static const struct clk_ops rtd129x_scpu_pll_ops = {
++	.recalc_rate = rtd129x_scpu_recalc_rate,
++	.determine_rate = rtd129x_scpu_determine_rate,
++	.set_rate = rtd129x_scpu_set_rate,
++};
++
++static int rtd129x_scpu_pll_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct clk_init_data init = {};
++	struct rtd129x_scpu_pll *pll;
++	struct clk_parent_data parent = { .index = 0 };
++	unsigned int ncode, fcode, sel, ctl;
++	int ret;
++
++	pll = devm_kzalloc(dev, sizeof(*pll), GFP_KERNEL);
++	if (!pll)
++		return -ENOMEM;
++
++	pll->dev = dev;
++	pll->regmap = syscon_node_to_regmap(dev->parent->of_node);
++	if (IS_ERR(pll->regmap))
++		return dev_err_probe(dev, PTR_ERR(pll->regmap),
++				     "no CRT syscon\n");
++
++	ret = of_property_read_u32(dev->of_node, "reg", &pll->base);
++	if (ret)
++		return dev_err_probe(dev, ret, "no reg\n");
++
++	ret = regmap_read(pll->regmap, pll->base + SSC_DIG_SCPU0, &ctl);
++	if (ret)
++		return ret;
++
++	ret = rtd129x_scpu_read(pll, &ncode, &fcode, &sel);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "NCODE %u FCODE %u scpu_freq_sel %u, SSC_DIG_SCPU0 %#x\n",
++		 ncode, fcode, sel, ctl);
++
++	/*
++	 * The vendor code always leaves OC_EN set. Without it the output
++	 * rate is not known (the BSP reports about 200 MHz), so do not
++	 * touch the PLL.
++	 */
++	if (!(ctl & SSC_DIG_SCPU0_OC_EN))
++		return dev_err_probe(dev, -ENODEV,
++				     "OC_EN is clear, leaving the PLL alone\n");
++
++	init.name = "pll_scpu";
++	init.ops = &rtd129x_scpu_pll_ops;
++	init.parent_data = &parent;
++	init.num_parents = 1;
++	init.flags = CLK_GET_RATE_NOCACHE;
++	pll->hw.init = &init;
++
++	ret = devm_clk_hw_register(dev, &pll->hw);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "SCPU at %lu Hz\n", clk_hw_get_rate(&pll->hw));
++
++	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get,
++					   &pll->hw);
++}
++
++static const struct of_device_id rtd129x_scpu_pll_of_match[] = {
++	{ .compatible = "realtek,rtd1295-scpu-pll" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rtd129x_scpu_pll_of_match);
++
++static struct platform_driver rtd129x_scpu_pll_driver = {
++	.probe = rtd129x_scpu_pll_probe,
++	.driver = {
++		.name = "rtd129x-scpu-pll",
++		.of_match_table = rtd129x_scpu_pll_of_match,
++		.suppress_bind_attrs = true,
++	},
++};
++module_platform_driver(rtd129x_scpu_pll_driver);
++
++MODULE_DESCRIPTION("Realtek RTD129x SCPU PLL driver");
++MODULE_LICENSE("GPL");

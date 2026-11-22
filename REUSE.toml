@@ -1,0 +1,16 @@
+version = 1
+
+[[annotations]]
+path = ["debian/overlay/etc/hostname", "debian/overlay/etc/hosts", "debian/overlay/etc/qnas-root", "platform/voice/README", "docs/**", "README.md", ".gitignore", "REUSE.toml"]
+SPDX-FileCopyrightText = "2026 HuskerMinion and contributors"
+SPDX-License-Identifier = "GPL-2.0-only"
+
+[[annotations]]
+path = "platform/voice/sounds/*.wav"
+SPDX-FileCopyrightText = "2026 HuskerMinion and contributors"
+SPDX-License-Identifier = "GPL-2.0-only"
+
+[[annotations]]
+path = "docs/images/banner.jpg"
+SPDX-FileCopyrightText = "2026 HuskerMinion"
+SPDX-License-Identifier = "GPL-2.0-only"

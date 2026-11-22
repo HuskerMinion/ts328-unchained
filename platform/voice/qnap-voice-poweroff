@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# /usr/lib/systemd/system-shutdown/qnap-voice-poweroff
+#
+# systemd-shutdown runs this right before the final reboot() call, after
+# all services are stopped and filesystems are unmounted or read-only.
+# The sound card is still there (it goes away only when the kernel shuts
+# its devices down, after this hook). $1 is poweroff, reboot, halt or kexec.
+
+[ "$1" = poweroff ] || exit 0
+exec /usr/local/sbin/qnap-voice poweroff

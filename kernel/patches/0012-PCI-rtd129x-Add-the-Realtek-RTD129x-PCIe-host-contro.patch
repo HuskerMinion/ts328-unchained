@@ -1,0 +1,1365 @@
+From 3fb59a99b053af4df34eacdc10698c05a26d257a Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 12/40] PCI: rtd129x: Add the Realtek RTD129x PCIe host
+ controller
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a host driver for the PCIe 1.1 ("slot 1") and PCIe 2.0 ("slot 2")
+root complexes of the Realtek RTD1293/RTD1295/RTD1296 SoCs.
+
+The link partner sits directly on the root bus, its configuration space
+is accessed through the controller's indirect configuration engine, and
+legacy interrupts are routed to one GIC SPI per slot via interrupt-map.
+
+On revision A0x chips CPU accesses to the 16 MiB PCIe memory windows
+(0xc0000000-0xc1ffffff) read as all ones, so for example AHCI fails
+with "Controller reset failed (0xffffffff)". Like the QNAP and Synology
+vendor kernels, route every device MMIO access through the controller's
+translated 4 KiB window instead: select the PCI page with PCI_TRANS
+(and a 2 KiB window for the offsets 0xcec/0xc68 that the vendor code
+avoids), access the window, and retry reads on a latched completion
+error. With CONFIG_PCIE_RTD129X_MMIO_HOOK, ioremap() of the windows
+returns the bus address as a cookie and the arm64 raw MMIO accessors
+hand such cookies to the driver. This costs one address compare per
+MMIO access, and BARs cannot be mapped to user space. The hook is
+compiled out for code that is not part of the kernel proper or must not
+call into it (the KVM nVHE/VHE hypervisor objects, the EFI stub and the
+early position-independent code); none of it accesses PCIe memory. The
+driver depends on ARM64, where the hook lives.
+
+The window registers are read back after each update, so the new
+translation is in place before the access. PCI_TRANS is programmed with
+CPU addresses, so probe rejects a memory window with a CPU-to-bus
+offset.
+
+Config accesses poll the completion status with interrupts off under
+the controller lock. A completion normally arrives within microseconds,
+so poll every 5 us for at most 1 ms per attempt; with the retries on a
+latched completion error the worst case stays at a few milliseconds.
+
+The bring-up sequence, PHY tuning tables, SB4 revision quirk and
+completion-error ("DLLP error patch") retry follow the Realtek vendor
+drivers (QNAP GPL 4.2.8 and Realtek BSP 4.9, by James Tai) and Andreas
+Färber's WIP driver, reworked to use the host bridge, reset, GPIO and
+syscon APIs; the copyright lines of the Realtek BSP driver and of
+Andreas Färber's driver are kept. Unlike the vendor code, the clock is
+ungated before the resets are released, because the boot loader leaves
+the PCIe clock gates off and slot 1 then does not train. PERST# (if
+described) is held from the start and released 200 ms (slot 1) or
+100 ms (slot 2) after the PHY setup, the delays the vendor code uses
+even without a PERST# GPIO, and the link gets 300 ms to come up.
+
+There is no RTD129x clock driver yet, so the clock is optional; without
+one, the clock-enable bit is set through the CRT syscon. The
+controller registers are accessed through the RBUS erratum helpers.
+
+To help with bring-up on other boards, the driver logs the SB2
+0x30-0x60 PCI registers and decodes MAC_ST when the link does not come
+up.
+
+After the link is up, the driver waits PCIE_RESET_CONFIG_WAIT_MS before
+the first configuration request, as the PCIe specification requires;
+the ASMedia SATA controller on slot 2 does not answer earlier.
+---
+ arch/arm64/include/asm/io.h                |  58 ++
+ arch/arm64/include/asm/rtd129x-pcie-mmio.h |  72 ++
+ arch/arm64/mm/ioremap.c                    |   4 +
+ drivers/pci/controller/Kconfig             |  30 +
+ drivers/pci/controller/Makefile            |   1 +
+ drivers/pci/controller/pcie-rtd129x.c      | 998 +++++++++++++++++++++
+ 6 files changed, 1163 insertions(+)
+ create mode 100644 arch/arm64/include/asm/rtd129x-pcie-mmio.h
+ create mode 100644 drivers/pci/controller/pcie-rtd129x.c
+
+diff --git a/arch/arm64/include/asm/io.h b/arch/arm64/include/asm/io.h
+index a8507de4f..b84cdfb5b 100644
+--- a/arch/arm64/include/asm/io.h
++++ b/arch/arm64/include/asm/io.h
+@@ -18,6 +18,7 @@
+ #include <asm/alternative.h>
+ #include <asm/cpufeature.h>
+ #include <asm/rsi.h>
++#include <asm/rtd129x-pcie-mmio.h>
+ 
+ /*
+  * Generic IO read/write.  These perform native-endian accesses.
+@@ -26,6 +27,12 @@
+ static __always_inline void __raw_writeb(u8 val, volatile void __iomem *addr)
+ {
+ 	volatile u8 __iomem *ptr = addr;
++
++	if (rtd129x_pcie_mmio_addr(addr)) {
++		rtd129x_pcie_mmio_write(addr, val, 1);
++		return;
++	}
++
+ 	asm volatile("strb %w0, %1" : : "rZ" (val), "Qo" (*ptr));
+ }
+ 
+@@ -33,6 +40,12 @@ static __always_inline void __raw_writeb(u8 val, volatile void __iomem *addr)
+ static __always_inline void __raw_writew(u16 val, volatile void __iomem *addr)
+ {
+ 	volatile u16 __iomem *ptr = addr;
++
++	if (rtd129x_pcie_mmio_addr(addr)) {
++		rtd129x_pcie_mmio_write(addr, val, 2);
++		return;
++	}
++
+ 	asm volatile("strh %w0, %1" : : "rZ" (val), "Qo" (*ptr));
+ }
+ 
+@@ -40,6 +53,12 @@ static __always_inline void __raw_writew(u16 val, volatile void __iomem *addr)
+ static __always_inline void __raw_writel(u32 val, volatile void __iomem *addr)
+ {
+ 	volatile u32 __iomem *ptr = addr;
++
++	if (rtd129x_pcie_mmio_addr(addr)) {
++		rtd129x_pcie_mmio_write(addr, val, 4);
++		return;
++	}
++
+ 	asm volatile("str %w0, %1" : : "rZ" (val), "Qo" (*ptr));
+ }
+ 
+@@ -47,6 +66,12 @@ static __always_inline void __raw_writel(u32 val, volatile void __iomem *addr)
+ static __always_inline void __raw_writeq(u64 val, volatile void __iomem *addr)
+ {
+ 	volatile u64 __iomem *ptr = addr;
++
++	if (rtd129x_pcie_mmio_addr(addr)) {
++		rtd129x_pcie_mmio_write(addr, val, 8);
++		return;
++	}
++
+ 	asm volatile("str %x0, %1" : : "rZ" (val), "Qo" (*ptr));
+ }
+ 
+@@ -54,6 +79,10 @@ static __always_inline void __raw_writeq(u64 val, volatile void __iomem *addr)
+ static __always_inline u8 __raw_readb(const volatile void __iomem *addr)
+ {
+ 	u8 val;
++
++	if (rtd129x_pcie_mmio_addr(addr))
++		return rtd129x_pcie_mmio_read(addr, 1);
++
+ 	asm volatile(ALTERNATIVE("ldrb %w0, [%1]",
+ 				 "ldarb %w0, [%1]",
+ 				 ARM64_WORKAROUND_DEVICE_LOAD_ACQUIRE)
+@@ -66,6 +95,9 @@ static __always_inline u16 __raw_readw(const volatile void __iomem *addr)
+ {
+ 	u16 val;
+ 
++	if (rtd129x_pcie_mmio_addr(addr))
++		return rtd129x_pcie_mmio_read(addr, 2);
++
+ 	asm volatile(ALTERNATIVE("ldrh %w0, [%1]",
+ 				 "ldarh %w0, [%1]",
+ 				 ARM64_WORKAROUND_DEVICE_LOAD_ACQUIRE)
+@@ -77,6 +109,10 @@ static __always_inline u16 __raw_readw(const volatile void __iomem *addr)
+ static __always_inline u32 __raw_readl(const volatile void __iomem *addr)
+ {
+ 	u32 val;
++
++	if (rtd129x_pcie_mmio_addr(addr))
++		return rtd129x_pcie_mmio_read(addr, 4);
++
+ 	asm volatile(ALTERNATIVE("ldr %w0, [%1]",
+ 				 "ldar %w0, [%1]",
+ 				 ARM64_WORKAROUND_DEVICE_LOAD_ACQUIRE)
+@@ -88,6 +124,10 @@ static __always_inline u32 __raw_readl(const volatile void __iomem *addr)
+ static __always_inline u64 __raw_readq(const volatile void __iomem *addr)
+ {
+ 	u64 val;
++
++	if (rtd129x_pcie_mmio_addr(addr))
++		return rtd129x_pcie_mmio_read(addr, 8);
++
+ 	asm volatile(ALTERNATIVE("ldr %0, [%1]",
+ 				 "ldar %0, [%1]",
+ 				 ARM64_WORKAROUND_DEVICE_LOAD_ACQUIRE)
+@@ -190,6 +230,15 @@ void __iowrite32_copy_full(void __iomem *to, const void *from, size_t count);
+ static __always_inline void
+ __iowrite32_copy(void __iomem *to, const void *from, size_t count)
+ {
++	if (rtd129x_pcie_mmio_addr(to)) {
++		u32 __iomem *dst = to;
++		const u32 *src = from;
++
++		while (count--)
++			__raw_writel(*src++, dst++);
++		return;
++	}
++
+ 	if (__builtin_constant_p(count) &&
+ 	    (count == 8 || count == 4 || count == 2 || count == 1)) {
+ 		__const_memcpy_toio_aligned32(to, from, count);
+@@ -247,6 +296,15 @@ void __iowrite64_copy_full(void __iomem *to, const void *from, size_t count);
+ static __always_inline void
+ __iowrite64_copy(void __iomem *to, const void *from, size_t count)
+ {
++	if (rtd129x_pcie_mmio_addr(to)) {
++		u64 __iomem *dst = to;
++		const u64 *src = from;
++
++		while (count--)
++			__raw_writeq(*src++, dst++);
++		return;
++	}
++
+ 	if (__builtin_constant_p(count) &&
+ 	    (count == 8 || count == 4 || count == 2 || count == 1)) {
+ 		__const_memcpy_toio_aligned64(to, from, count);
+diff --git a/arch/arm64/include/asm/rtd129x-pcie-mmio.h b/arch/arm64/include/asm/rtd129x-pcie-mmio.h
+new file mode 100644
+index 000000000..91741cf26
+--- /dev/null
++++ b/arch/arm64/include/asm/rtd129x-pcie-mmio.h
+@@ -0,0 +1,72 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Realtek RTD129x PCIe memory access hook
++ *
++ * On RTD1295/RTD1296 revision A0x the CPU cannot reach the PCIe memory
++ * windows (0xc0000000-0xc1ffffff) directly: those loads return all ones.
++ * The vendor kernels instead route every access through a translated 4 KiB
++ * window in each controller. With CONFIG_PCIE_RTD129X_MMIO_HOOK, ioremap()
++ * of an address in those windows returns the bus address itself as a cookie,
++ * and the raw MMIO accessors divert cookies to the PCIe driver.
++ *
++ * The hook is compiled out for code that is not linked into, or must not
++ * call into, the kernel proper: the KVM nVHE and VHE hypervisor objects
++ * (which run at EL2 and are linked with a symbol prefix), and the EFI stub
++ * and early position-independent code (built with __DISABLE_EXPORTS).
++ * None of them accesses PCIe memory.
++ */
++#ifndef __ASM_RTD129X_PCIE_MMIO_H
++#define __ASM_RTD129X_PCIE_MMIO_H
++
++#include <linux/compiler.h>
++#include <linux/types.h>
++
++#if defined(CONFIG_PCIE_RTD129X_MMIO_HOOK) &&	\
++	!defined(__KVM_NVHE_HYPERVISOR__) &&		\
++	!defined(__KVM_VHE_HYPERVISOR__) &&		\
++	!defined(__DISABLE_EXPORTS)
++
++#define RTD129X_PCIE_MMIO_START		0xc0000000UL
++#define RTD129X_PCIE_MMIO_SIZE		0x02000000UL
++
++static __always_inline bool
++rtd129x_pcie_mmio_addr(const volatile void __iomem *addr)
++{
++	return unlikely((unsigned long)addr - RTD129X_PCIE_MMIO_START <
++			RTD129X_PCIE_MMIO_SIZE);
++}
++
++u64 rtd129x_pcie_mmio_read(const volatile void __iomem *addr,
++			   unsigned int size);
++void rtd129x_pcie_mmio_write(volatile void __iomem *addr, u64 val,
++			     unsigned int size);
++void __iomem *rtd129x_pcie_mmio_ioremap(phys_addr_t phys, size_t size);
++
++#else
++
++static __always_inline bool
++rtd129x_pcie_mmio_addr(const volatile void __iomem *addr)
++{
++	return false;
++}
++
++static inline u64 rtd129x_pcie_mmio_read(const volatile void __iomem *addr,
++					 unsigned int size)
++{
++	return ~0ULL;
++}
++
++static inline void rtd129x_pcie_mmio_write(volatile void __iomem *addr,
++					   u64 val, unsigned int size)
++{
++}
++
++static inline void __iomem *rtd129x_pcie_mmio_ioremap(phys_addr_t phys,
++						      size_t size)
++{
++	return NULL;
++}
++
++#endif /* CONFIG_PCIE_RTD129X_MMIO_HOOK && !hyp && !__DISABLE_EXPORTS */
++
++#endif /* __ASM_RTD129X_PCIE_MMIO_H */
+diff --git a/arch/arm64/mm/ioremap.c b/arch/arm64/mm/ioremap.c
+index 1e4794a2a..b97f2714a 100644
+--- a/arch/arm64/mm/ioremap.c
++++ b/arch/arm64/mm/ioremap.c
+@@ -19,6 +19,10 @@ void __iomem *__ioremap_prot(phys_addr_t phys_addr, size_t size,
+ {
+ 	unsigned long last_addr = phys_addr + size - 1;
+ 
++	/* RTD129x PCIe windows are reached through the PCIe driver */
++	if (rtd129x_pcie_mmio_addr((const void __iomem *)(unsigned long)phys_addr))
++		return rtd129x_pcie_mmio_ioremap(phys_addr, size);
++
+ 	/* Don't allow outside PHYS_MASK */
+ 	if (last_addr & ~PHYS_MASK)
+ 		return NULL;
+diff --git a/drivers/pci/controller/Kconfig b/drivers/pci/controller/Kconfig
+index 0452151a7..0e8624b4a 100644
+--- a/drivers/pci/controller/Kconfig
++++ b/drivers/pci/controller/Kconfig
+@@ -269,6 +269,36 @@ config PCIE_ROCKCHIP
+ 	bool
+ 	depends on PCI
+ 
++config PCIE_RTD129X
++	bool "Realtek RTD129x PCIe host controller"
++	depends on ARCH_REALTEK || COMPILE_TEST
++	depends on ARM64
++	depends on OF
++	select MFD_SYSCON
++	select RTD129X_RBUS_LOCK
++	help
++	  Say Y here to enable the two PCIe root complexes of the Realtek
++	  RTD1293/RTD1295/RTD1296 SoCs (one PCIe 1.1 and one PCIe 2.0
++	  single-lane port).
++
++config PCIE_RTD129X_MMIO_HOOK
++	bool "Route RTD129x PCIe memory accesses through the translated window"
++	depends on PCIE_RTD129X
++	default y
++	help
++	  On RTD1295/RTD1296 revision A0x the CPU cannot access the PCIe memory
++	  windows (0xc0000000-0xc1ffffff) directly; reads return all ones.
++	  The vendor kernels route every device register access through a
++	  translated 4 KiB window in the controller instead.
++
++	  This option does the same: ioremap() of those windows returns a
++	  cookie, and the arm64 MMIO accessors hand cookie accesses to the
++	  PCIe driver. Every MMIO access in the kernel gets one extra address
++	  compare. Mapping BARs to user space (sysfs resource files, /dev/mem)
++	  does not work with this option.
++
++	  Say Y on RTD129x A00/A01 boards such as the QNAP TS-328.
++
+ config PCIE_ROCKCHIP_HOST
+ 	tristate "Rockchip PCIe controller (host mode)"
+ 	depends on ARCH_ROCKCHIP || COMPILE_TEST
+diff --git a/drivers/pci/controller/Makefile b/drivers/pci/controller/Makefile
+index 038ccbd9e..64ead89b6 100644
+--- a/drivers/pci/controller/Makefile
++++ b/drivers/pci/controller/Makefile
+@@ -28,6 +28,7 @@ obj-$(CONFIG_PCIE_IPROC_PLATFORM) += pcie-iproc-platform.o
+ obj-$(CONFIG_PCIE_IPROC_BCMA) += pcie-iproc-bcma.o
+ obj-$(CONFIG_PCIE_ALTERA) += pcie-altera.o
+ obj-$(CONFIG_PCIE_ALTERA_MSI) += pcie-altera-msi.o
++obj-$(CONFIG_PCIE_RTD129X) += pcie-rtd129x.o
+ obj-$(CONFIG_PCIE_ROCKCHIP) += pcie-rockchip.o
+ obj-$(CONFIG_PCIE_ROCKCHIP_EP) += pcie-rockchip-ep.o
+ obj-$(CONFIG_PCIE_ROCKCHIP_HOST) += pcie-rockchip-host.o
+diff --git a/drivers/pci/controller/pcie-rtd129x.c b/drivers/pci/controller/pcie-rtd129x.c
+new file mode 100644
+index 000000000..e69c0991b
+--- /dev/null
++++ b/drivers/pci/controller/pcie-rtd129x.c
+@@ -0,0 +1,998 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Realtek RTD1293/RTD1295/RTD1296 PCIe host controller driver
++ *
++ * The SoC has two independent single-lane root complexes:
++ *   slot 1: PCIe 1.1 controller at 0x9804e000 (vendor "PCIE0" resources)
++ *   slot 2: PCIe 2.0 controller at 0x9803b000 (vendor "PCIE1" resources)
++ *
++ * The root port is not visible as a PCI bridge. The link partner appears
++ * directly on the root bus and its configuration space is reached through
++ * an indirect access engine in the controller's application registers.
++ * Device BARs live in the 16 MiB memory window of each slot, but the CPU
++ * cannot access that window directly: every device MMIO access goes
++ * through a 4 KiB translated window in the controller (see
++ * asm/rtd129x-pcie-mmio.h and CONFIG_PCIE_RTD129X_MMIO_HOOK).
++ *
++ * Based on the Realtek vendor drivers by James Tai (QNAP GPL 4.2.8
++ * pcie{,2}-rtd1295.c, Realtek BSP 4.9 pcie-rtd129x-slot{1,2}.c, the
++ * latter Copyright (c) 2017 Realtek Semiconductor Corp.) and on the
++ * work-in-progress driver by Andreas Färber, which is
++ * Copyright (c) 2017 Andreas Färber
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/iopoll.h>
++#include <linux/mfd/syscon.h>
++#include <linux/mod_devicetable.h>
++#include <linux/of.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/reset.h>
++#include <linux/soc/realtek/rtd129x-lock.h>
++#include <linux/spinlock.h>
++#include <linux/sizes.h>
++
++#include <asm/rtd129x-pcie-mmio.h>
++
++#include "../pci.h"
++
++/* Root complex configuration space (DBI), DesignWare-like layout */
++#define RTD129X_PCIE_COMMAND		0x004
++#define RTD129X_PCIE_MEM_BASE_LIMIT	0x020
++#define RTD129X_PCIE_PREF_BASE_LIMIT	0x024
++#define RTD129X_PCIE_LNKCTL_LNKSTA	0x080
++#define RTD129X_PCIE_LNKCTL2		0x0a0
++#define  LNKCTL2_TARGET_SPEED		GENMASK(3, 0)
++#define RTD129X_PCIE_PORT_LINK_CTRL	0x710
++
++/* Application ("DVR bridge") registers */
++#define RTD129X_PCIE_SYS_CTR		0xc00
++#define  SYS_CTR_TRAN_EN		BIT(20)
++#define  SYS_CTR_MMIO_TYPE		BIT(19)
++#define  SYS_CTR_PHY_MDIO_OE		BIT(18)
++#define  SYS_CTR_PHY_MDIO_RSTN		BIT(17)
++#define  SYS_CTR_INDIR_CFG_EN		BIT(5)
++#define  SYS_CTR_DIR_CFG_EN		BIT(4)
++#define  SYS_CTR_APP_LTSSM_EN		BIT(1)
++#define RTD129X_PCIE_INDIR_CTR		0xc14
++#define  INDIR_CTR_REQ_FMT		GENMASK(1, 0)
++#define  INDIR_CTR_REQ_TYPE		GENMASK(6, 2)
++#define RTD129X_PCIE_MDIO_CTR		0xc1c
++#define  MDIO_CTR_DATA			GENMASK(31, 16)
++#define  MDIO_CTR_PHY_ADDR		GENMASK(15, 13)
++#define  MDIO_CTR_REG_ADDR		GENMASK(12, 8)
++#define  MDIO_CTR_SRST			BIT(1)
++#define  MDIO_CTR_WRITE			BIT(0)
++#define RTD129X_PCIE_CFG_CT		0xc38
++#define  CFG_CT_GO			BIT(0)
++#define RTD129X_PCIE_CFG_EN		0xc3c
++#define  CFG_EN_BYTE_CNT		GENMASK(7, 4)
++#define  CFG_EN_BYTE_EN			BIT(1)
++#define  CFG_EN_WRITE			BIT(0)
++#define RTD129X_PCIE_CFG_ST		0xc40
++#define  CFG_ST_ERROR			BIT(1)
++#define  CFG_ST_DONE			BIT(0)
++#define RTD129X_PCIE_CFG_ADDR		0xc44
++#define RTD129X_PCIE_CFG_WDATA		0xc48
++#define RTD129X_PCIE_CFG_RDATA		0xc4c
++#define RTD129X_PCIE_DIR_EN		0xc78
++#define  DIR_EN_TIMEOUT_CNT		GENMASK(31, 8)
++#define  DIR_EN_TIMEOUT_EN		BIT(0)
++#define RTD129X_PCIE_RCPL_ST		0xc7c
++#define  RCPL_ST_ERRORS			GENMASK(4, 0)
++#define RTD129X_PCIE_MAC_ST		0xcb4
++#define  MAC_ST_CLK_RDY			BIT(16)
++#define  MAC_ST_LINK_UP			BIT(11)
++#define  MAC_ST_LTSSM			GENMASK(7, 4)
++#define RTD129X_PCIE_PCI_BASE		0xcfc
++#define RTD129X_PCIE_PCI_MASK		0xd00
++#define RTD129X_PCIE_PCI_TRANS		0xd04
++
++/* Indirect config request types (TLP fmt/type) */
++#define INDIR_CTR_CFG_RD0	FIELD_PREP(INDIR_CTR_REQ_TYPE, 0x4)
++#define INDIR_CTR_CFG_WR0	(FIELD_PREP(INDIR_CTR_REQ_TYPE, 0x4) | \
++				 FIELD_PREP(INDIR_CTR_REQ_FMT, 0x2))
++
++/* SB4 registers (0x9801c600), only touched on early chip revisions */
++#define SB4_PCIE_MODE			0x00
++#define SB4_PCIE_CTRL8			0x08
++#define SB4_PCIE_CTRL14			0x14
++
++/* SB2 chip revision register */
++#define SB2_CHIP_REV			0x204
++#define SB2_PCI_BASE0			0x030
++#define RTD129X_REV_A00			0x00000
++#define RTD129X_REV_A01			0x10000
++#define RTD129X_REV_B00			0x20000
++
++#define RTD129X_PCIE_NUM_RESETS		7
++#define RTD129X_PCIE_LINK_TIMEOUT_US	300000
++/*
++ * Config accesses are polled with IRQs off under pcie->lock. A completion
++ * normally arrives within a few microseconds, so give up after 1 ms per
++ * attempt: with the retries below the worst case stays at about 6 ms
++ * (plus 200 us on A00) instead of over a second.
++ */
++#define RTD129X_PCIE_CFG_TIMEOUT_US	1000
++#define RTD129X_PCIE_CFG_RETRIES	5
++
++/* One MDIO write: PHY sub-address, register, 16-bit value */
++#define RTD_PHY(addr, reg, val)					\
++	(FIELD_PREP_CONST(MDIO_CTR_DATA, (val)) |		\
++	 FIELD_PREP_CONST(MDIO_CTR_PHY_ADDR, (addr)) |		\
++	 FIELD_PREP_CONST(MDIO_CTR_REG_ADDR, (reg)) | MDIO_CTR_WRITE)
++
++/* PCIe 1.1 PHY, revisions A00/A01 (QNAP 4.2.8, BSP 4.9 "phys_a") */
++static const u32 rtd129x_pcie_slot1_phy_a[] = {
++	RTD_PHY(0, 0x08, 0x3181),
++	RTD_PHY(0, 0x11, 0xb200),
++	RTD_PHY(0, 0x00, 0x0010),
++};
++
++/* PCIe 1.1 PHY, revision B00 and later (BSP 4.9 "phys_b") */
++static const u32 rtd129x_pcie_slot1_phy_b[] = {
++	RTD_PHY(0, 0x00, 0x0090),
++	RTD_PHY(0, 0x04, 0x4008),
++	RTD_PHY(0, 0x08, 0x5ac1),
++	RTD_PHY(0, 0x0f, 0x32b4),
++	RTD_PHY(0, 0x11, 0x7200),
++};
++
++/* PCIe 2.0 PHY as programmed by the QNAP 4.2.8 kernel (A01 boards) */
++static const u32 rtd129x_pcie_slot2_phy_a[] = {
++	RTD_PHY(0, 0x03, 0x27e9),
++	RTD_PHY(0, 0x04, 0x52f5),	/* F code, close SSC */
++	RTD_PHY(0, 0x05, 0xead7),	/* N code */
++	RTD_PHY(0, 0x06, 0x000c),	/* CMU ICP (TX jitter) */
++	RTD_PHY(0, 0x0a, 0xa653),	/* CMU RS (TX jitter) */
++	RTD_PHY(1, 0x00, 0xc466),	/* AMP */
++	RTD_PHY(0, 0x01, 0xa84a),	/* RX parameters */
++	RTD_PHY(1, 0x0b, 0xb803),	/* clock driving */
++	RTD_PHY(2, 0x03, 0x27e9),	/* EQ */
++	RTD_PHY(2, 0x04, 0x52f5),	/* F code, close SSC */
++	RTD_PHY(2, 0x05, 0xead7),	/* N code */
++	RTD_PHY(2, 0x06, 0x000c),	/* CMU ICP (TX jitter) */
++	RTD_PHY(2, 0x0a, 0xa653),	/* CMU RS (TX jitter) */
++	RTD_PHY(3, 0x00, 0xd477),	/* AMP */
++	RTD_PHY(2, 0x01, 0xa84a),	/* RX parameters */
++	RTD_PHY(3, 0x0b, 0xa803),	/* clock driving */
++	RTD_PHY(2, 0x1a, 0x0122),
++	RTD_PHY(0, 0x09, 0x521c),	/* calibration: bit 9 = 1 */
++	RTD_PHY(0, 0x09, 0x501c),	/* calibration: bit 9 = 0 */
++	RTD_PHY(0, 0x09, 0x521c),	/* calibration: bit 9 = 1 */
++	RTD_PHY(1, 0x04, 0x0828),
++	RTD_PHY(3, 0x04, 0x0828),
++};
++
++/* PCIe 2.0 PHY as programmed by the Realtek BSP 4.9 kernel */
++static const u32 rtd129x_pcie_slot2_phy_b[] = {
++	RTD_PHY(0, 0x03, 0x27e9),
++	RTD_PHY(0, 0x04, 0x52f5),
++	RTD_PHY(0, 0x05, 0xead7),
++	RTD_PHY(0, 0x06, 0x000c),
++	RTD_PHY(0, 0x0a, 0xa653),
++	RTD_PHY(1, 0x00, 0xc466),
++	RTD_PHY(0, 0x1b, 0x8ea0),
++	RTD_PHY(2, 0x1b, 0x8ea0),
++	RTD_PHY(0, 0x01, 0xa84a),
++	RTD_PHY(1, 0x0b, 0xb803),
++	RTD_PHY(2, 0x03, 0x27e9),
++	RTD_PHY(2, 0x04, 0x52f5),
++	RTD_PHY(2, 0x05, 0xead7),
++	RTD_PHY(2, 0x06, 0x000c),
++	RTD_PHY(2, 0x0a, 0xa653),
++	RTD_PHY(3, 0x00, 0xd477),
++	RTD_PHY(2, 0x01, 0xa84a),
++	RTD_PHY(3, 0x0b, 0xa803),
++	RTD_PHY(2, 0x1a, 0x0122),
++	RTD_PHY(0, 0x09, 0x521c),
++	RTD_PHY(0, 0x09, 0x501c),
++	RTD_PHY(0, 0x09, 0x521c),
++	RTD_PHY(1, 0x04, 0x0828),
++	RTD_PHY(3, 0x04, 0x0828),
++};
++
++struct rtd129x_pcie_slot {
++	unsigned int id;
++	unsigned int max_gen;
++	/* CRT clock-enable fallback when no clock provider is available */
++	unsigned int crt_clk_reg;
++	u32 crt_clk_bit;
++	/* Field cleared in SB4 0x00 on early revisions */
++	u32 sb4_mode_mask;
++	const u32 *phy_a;
++	unsigned int num_phy_a;
++	const u32 *phy_b;
++	unsigned int num_phy_b;
++	/* Vendor delay between PHY setup and PERST# deassertion */
++	unsigned int perst_delay_ms;
++};
++
++struct rtd129x_pcie {
++	struct device *dev;
++	const struct rtd129x_pcie_slot *slot;
++	void __iomem *base;
++	void __iomem *win_base;
++	resource_size_t cfg_window;
++	struct resource *mem;
++	/* Current PCI_MASK / PCI_TRANS of the translated window */
++	u32 win_mask;
++	u32 win_trans;
++	struct regmap *sb4;
++	struct regmap *crt;
++	struct clk *clk;
++	bool crt_clk_enabled;
++	struct reset_control_bulk_data resets[RTD129X_PCIE_NUM_RESETS];
++	struct gpio_desc *perst;
++	unsigned int max_gen;
++	u32 revision;
++	bool rtd1296;
++	/* Serializes config accesses and translated-window MMIO */
++	raw_spinlock_t lock;
++};
++
++/*
++ * All controller register accesses go through the RTD129x RBUS erratum
++ * helpers. They only serialize against eMMC for offsets 0x800-0x9ff of a
++ * 4 KiB block; none of the registers used here fall in that range, so in
++ * practice no lock is taken, but any register added later is covered.
++ */
++static u32 rtd129x_pcie_readl(struct rtd129x_pcie *pcie, unsigned int reg)
++{
++	return rtd129x_rbus_readl(pcie->base + reg);
++}
++
++static void rtd129x_pcie_writel(struct rtd129x_pcie *pcie, unsigned int reg,
++				u32 val)
++{
++	rtd129x_rbus_writel(val, pcie->base + reg);
++}
++
++static bool rtd129x_pcie_cfg_valid(struct pci_bus *bus, unsigned int devfn)
++{
++	/* Only the link partner, function 0, sits behind the root complex */
++	return pci_is_root_bus(bus) && devfn == PCI_DEVFN(0, 0);
++}
++
++static u32 rtd129x_pcie_cfg_addr(struct pci_bus *bus, unsigned int devfn,
++				 int where)
++{
++	return ((u32)bus->number << 24) | (PCI_SLOT(devfn) << 19) |
++	       (PCI_FUNC(devfn) << 16) | where;
++}
++
++static int rtd129x_pcie_cfg_wait(struct rtd129x_pcie *pcie)
++{
++	u32 st;
++	int ret;
++
++	ret = read_poll_timeout_atomic(rtd129x_pcie_readl, st, st & CFG_ST_DONE,
++				       5, RTD129X_PCIE_CFG_TIMEOUT_US, false,
++				       pcie, RTD129X_PCIE_CFG_ST);
++	if (ret || (st & CFG_ST_ERROR))
++		ret = -EIO;
++
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_CFG_ST,
++			    CFG_ST_ERROR | CFG_ST_DONE);
++
++	return ret;
++}
++
++static int rtd129x_pcie_cfg_read_once(struct rtd129x_pcie *pcie, u32 addr,
++				      int size, u32 *val)
++{
++	unsigned int shift = (addr & 0x3) * BITS_PER_BYTE;
++	u32 be = GENMASK((addr & 0x3) + size - 1, addr & 0x3);
++	u32 data;
++
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_INDIR_CTR, INDIR_CTR_CFG_RD0);
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_CFG_ST,
++			    CFG_ST_ERROR | CFG_ST_DONE);
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_CFG_ADDR, addr & ~0x3);
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_CFG_EN,
++			    FIELD_PREP(CFG_EN_BYTE_CNT, be) | CFG_EN_BYTE_EN);
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_CFG_CT, CFG_CT_GO);
++
++	if (rtd129x_pcie_cfg_wait(pcie))
++		return -EIO;
++
++	data = rtd129x_pcie_readl(pcie, RTD129X_PCIE_CFG_RDATA);
++	*val = (data >> shift) & GENMASK(size * BITS_PER_BYTE - 1, 0);
++
++	return 0;
++}
++
++static int rtd129x_pcie_read_conf(struct pci_bus *bus, unsigned int devfn,
++				  int where, int size, u32 *val)
++{
++	struct rtd129x_pcie *pcie = bus->sysdata;
++	unsigned int retry = RTD129X_PCIE_CFG_RETRIES;
++	unsigned long flags;
++	u32 addr, st;
++	int ret;
++
++	if (!rtd129x_pcie_cfg_valid(bus, devfn))
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	addr = rtd129x_pcie_cfg_addr(bus, devfn, where);
++
++	raw_spin_lock_irqsave(&pcie->lock, flags);
++
++	if (pcie->revision == RTD129X_REV_A00)
++		udelay(200);
++
++	do {
++		ret = rtd129x_pcie_cfg_read_once(pcie, addr, size, val);
++
++		/*
++		 * Vendor "DLLP error patch": a completion error is latched in
++		 * RCPL_ST; clear it and repeat the access a few times.
++		 */
++		st = rtd129x_pcie_readl(pcie, RTD129X_PCIE_RCPL_ST);
++		if (!(st & RCPL_ST_ERRORS))
++			break;
++		rtd129x_pcie_writel(pcie, RTD129X_PCIE_RCPL_ST, st);
++		dev_dbg(pcie->dev, "cfg read %#x: completion error %#x\n",
++			addr, st);
++	} while (retry--);
++
++	raw_spin_unlock_irqrestore(&pcie->lock, flags);
++
++	return ret ? PCIBIOS_SET_FAILED : PCIBIOS_SUCCESSFUL;
++}
++
++static int rtd129x_pcie_write_conf(struct pci_bus *bus, unsigned int devfn,
++				   int where, int size, u32 val)
++{
++	struct rtd129x_pcie *pcie = bus->sysdata;
++	unsigned int shift = (where & 0x3) * BITS_PER_BYTE;
++	u32 be = GENMASK((where & 0x3) + size - 1, where & 0x3);
++	unsigned long flags;
++	u32 addr, en;
++	int ret;
++
++	if (!rtd129x_pcie_cfg_valid(bus, devfn))
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	addr = rtd129x_pcie_cfg_addr(bus, devfn, where);
++	en = CFG_EN_WRITE;
++	if (size != 4)
++		en |= FIELD_PREP(CFG_EN_BYTE_CNT, be) | CFG_EN_BYTE_EN;
++
++	raw_spin_lock_irqsave(&pcie->lock, flags);
++
++	if (pcie->revision == RTD129X_REV_A00)
++		udelay(200);
++
++	/*
++	 * The vendor drivers also point PCI_TRANS at each BAR as it is
++	 * programmed. That window is now owned by the MMIO path below, which
++	 * sets PCI_TRANS for every access, so this is not done here.
++	 */
++
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_INDIR_CTR, INDIR_CTR_CFG_WR0);
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_CFG_ST,
++			    CFG_ST_ERROR | CFG_ST_DONE);
++	/* The vendor code passes the unaligned address for writes */
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_CFG_ADDR, addr);
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_CFG_WDATA, val << shift);
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_CFG_EN, en);
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_CFG_CT, CFG_CT_GO);
++
++	ret = rtd129x_pcie_cfg_wait(pcie);
++
++	raw_spin_unlock_irqrestore(&pcie->lock, flags);
++
++	return ret ? PCIBIOS_SET_FAILED : PCIBIOS_SUCCESSFUL;
++}
++
++static struct pci_ops rtd129x_pcie_ops = {
++	.read	= rtd129x_pcie_read_conf,
++	.write	= rtd129x_pcie_write_conf,
++};
++
++/*
++ * Translated window MMIO
++ *
++ * Device memory behind the RTD129x A0x root complexes is not reachable by
++ * plain CPU loads and stores. Every access is instead done through the
++ * 4 KiB "cfg" window of the slot: PCI_TRANS selects the PCI page, the
++ * access goes to the matching offset in the window. This is what the QNAP
++ * and Synology vendor kernels do (rtk_pcie{1,2}_read/write) for all
++ * device MMIO.
++ */
++#ifdef CONFIG_PCIE_RTD129X_MMIO_HOOK
++
++static struct rtd129x_pcie *rtd129x_pcie_mmio_slots[2];
++
++static struct rtd129x_pcie *rtd129x_pcie_mmio_find(unsigned long addr,
++						   size_t size)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(rtd129x_pcie_mmio_slots); i++) {
++		struct rtd129x_pcie *pcie = READ_ONCE(rtd129x_pcie_mmio_slots[i]);
++
++		if (pcie && addr >= pcie->mem->start &&
++		    addr + size - 1 <= pcie->mem->end)
++			return pcie;
++	}
++
++	return NULL;
++}
++
++static void rtd129x_pcie_mmio_register(struct rtd129x_pcie *pcie, bool on)
++{
++	WRITE_ONCE(rtd129x_pcie_mmio_slots[pcie->slot->id - 1],
++		   on ? pcie : NULL);
++}
++
++/* Called with pcie->lock held. Returns the window address to access. */
++static void __iomem *rtd129x_pcie_mmio_select(struct rtd129x_pcie *pcie,
++					      unsigned long addr)
++{
++	unsigned int off = addr & (SZ_4K - 1);
++	u32 mask, trans;
++
++	/*
++	 * Vendor: window offsets 0xcec (and 0xc68 on PCIe 2.0, applied to
++	 * both slots) "can't be used because of 1295 hardware issue"; use a
++	 * 2 KiB window for them so they land at 0x4ec/0x468 instead.
++	 */
++	if (off == 0xcec || off == 0xc68)
++		mask = ~(u32)(SZ_2K - 1);
++	else
++		mask = ~(u32)(SZ_4K - 1);
++	trans = addr & mask;
++
++	/*
++	 * addr is a CPU address; it equals the bus address because probe
++	 * rejects memory windows with a CPU-to-bus offset. Each register is
++	 * read back so the new translation is in place before the access.
++	 */
++	if (pcie->win_mask != mask) {
++		rtd129x_pcie_writel(pcie, RTD129X_PCIE_PCI_MASK, mask);
++		rtd129x_pcie_readl(pcie, RTD129X_PCIE_PCI_MASK);
++		pcie->win_mask = mask;
++	}
++	if (pcie->win_trans != trans) {
++		rtd129x_pcie_writel(pcie, RTD129X_PCIE_PCI_TRANS, trans);
++		rtd129x_pcie_readl(pcie, RTD129X_PCIE_PCI_TRANS);
++		pcie->win_trans = trans;
++	}
++
++	return pcie->win_base + (addr & ~mask);
++}
++
++static u32 rtd129x_pcie_win_read(void __iomem *p, unsigned int size)
++{
++	unsigned long flags = 0;
++	bool locked = rtd129x_rbus_addr_affected(p);
++	u32 val;
++
++	if (locked)
++		flags = rtd129x_rbus_lock();
++
++	switch (size) {
++	case 1:
++		val = readb(p);
++		break;
++	case 2:
++		val = readw(p);
++		break;
++	default:
++		val = readl(p);
++		break;
++	}
++
++	if (locked)
++		rtd129x_rbus_unlock(flags);
++
++	return val;
++}
++
++static void rtd129x_pcie_win_write(void __iomem *p, u32 val, unsigned int size)
++{
++	unsigned long flags = 0;
++	bool locked = rtd129x_rbus_addr_affected(p);
++
++	if (locked)
++		flags = rtd129x_rbus_lock();
++
++	switch (size) {
++	case 1:
++		writeb(val, p);
++		break;
++	case 2:
++		writew(val, p);
++		break;
++	default:
++		writel(val, p);
++		break;
++	}
++
++	if (locked)
++		rtd129x_rbus_unlock(flags);
++}
++
++static u32 rtd129x_pcie_mmio_read32(struct rtd129x_pcie *pcie,
++				    unsigned long addr, unsigned int size)
++{
++	unsigned int retry = RTD129X_PCIE_CFG_RETRIES;
++	unsigned long flags;
++	void __iomem *p;
++	u32 val, st;
++
++	raw_spin_lock_irqsave(&pcie->lock, flags);
++
++	p = rtd129x_pcie_mmio_select(pcie, addr);
++	do {
++		val = rtd129x_pcie_win_read(p, size);
++
++		/* Vendor "DLLP error patch": retry on a latched error */
++		st = rtd129x_pcie_readl(pcie, RTD129X_PCIE_RCPL_ST);
++		if (!(st & RCPL_ST_ERRORS))
++			break;
++		rtd129x_pcie_writel(pcie, RTD129X_PCIE_RCPL_ST, st);
++	} while (retry--);
++
++	raw_spin_unlock_irqrestore(&pcie->lock, flags);
++
++	return val;
++}
++
++static void rtd129x_pcie_mmio_write32(struct rtd129x_pcie *pcie,
++				      unsigned long addr, u32 val,
++				      unsigned int size)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&pcie->lock, flags);
++	rtd129x_pcie_win_write(rtd129x_pcie_mmio_select(pcie, addr), val, size);
++	raw_spin_unlock_irqrestore(&pcie->lock, flags);
++}
++
++u64 rtd129x_pcie_mmio_read(const volatile void __iomem *addr, unsigned int size)
++{
++	unsigned long a = (unsigned long)addr;
++	struct rtd129x_pcie *pcie = rtd129x_pcie_mmio_find(a, size);
++	u64 lo, hi;
++
++	if (!pcie) {
++		pr_warn_ratelimited("pcie-rtd129x: read from unmapped %#lx\n", a);
++		return ~0ULL;
++	}
++
++	if (size != 8)
++		return rtd129x_pcie_mmio_read32(pcie, a, size);
++
++	/* 64-bit accesses are split, low word first (vendor readq) */
++	lo = rtd129x_pcie_mmio_read32(pcie, a, 4);
++	hi = rtd129x_pcie_mmio_read32(pcie, a + 4, 4);
++
++	return lo | (hi << 32);
++}
++EXPORT_SYMBOL(rtd129x_pcie_mmio_read);
++
++void rtd129x_pcie_mmio_write(volatile void __iomem *addr, u64 val,
++			     unsigned int size)
++{
++	unsigned long a = (unsigned long)addr;
++	struct rtd129x_pcie *pcie = rtd129x_pcie_mmio_find(a, size);
++
++	if (!pcie) {
++		pr_warn_ratelimited("pcie-rtd129x: write to unmapped %#lx\n", a);
++		return;
++	}
++
++	if (size != 8) {
++		rtd129x_pcie_mmio_write32(pcie, a, val, size);
++		return;
++	}
++
++	rtd129x_pcie_mmio_write32(pcie, a, lower_32_bits(val), 4);
++	rtd129x_pcie_mmio_write32(pcie, a + 4, upper_32_bits(val), 4);
++}
++EXPORT_SYMBOL(rtd129x_pcie_mmio_write);
++
++void __iomem *rtd129x_pcie_mmio_ioremap(phys_addr_t phys, size_t size)
++{
++	if (!size || !rtd129x_pcie_mmio_find(phys, size)) {
++		pr_warn("pcie-rtd129x: ioremap of %pa (%zu bytes) outside an active window\n",
++			&phys, size);
++		return NULL;
++	}
++
++	/* The cookie is the bus address itself; it is never dereferenced */
++	return (void __iomem *)(unsigned long)phys;
++}
++EXPORT_SYMBOL(rtd129x_pcie_mmio_ioremap);
++
++#else
++
++static void rtd129x_pcie_mmio_register(struct rtd129x_pcie *pcie, bool on)
++{
++}
++
++#endif /* CONFIG_PCIE_RTD129X_MMIO_HOOK */
++
++static int rtd129x_pcie_clk_enable(struct rtd129x_pcie *pcie)
++{
++	const struct rtd129x_pcie_slot *slot = pcie->slot;
++	u32 val;
++	int ret;
++
++	if (pcie->clk)
++		return clk_prepare_enable(pcie->clk);
++
++	/*
++	 * There is no RTD129x clock driver yet. If the CRT syscon is given,
++	 * set the gate bit ourselves when the boot loader left it off.
++	 */
++	if (!pcie->crt)
++		return 0;
++
++	ret = regmap_read(pcie->crt, slot->crt_clk_reg, &val);
++	if (ret)
++		return ret;
++
++	if (val & slot->crt_clk_bit)
++		return 0;
++
++	dev_info(pcie->dev, "enabling clock gate in CRT %#x\n",
++		 slot->crt_clk_reg);
++	ret = regmap_set_bits(pcie->crt, slot->crt_clk_reg, slot->crt_clk_bit);
++	if (!ret)
++		pcie->crt_clk_enabled = true;
++
++	return ret;
++}
++
++static void rtd129x_pcie_clk_disable(struct rtd129x_pcie *pcie)
++{
++	if (pcie->clk)
++		clk_disable_unprepare(pcie->clk);
++	else if (pcie->crt_clk_enabled)
++		regmap_clear_bits(pcie->crt, pcie->slot->crt_clk_reg,
++				  pcie->slot->crt_clk_bit);
++	pcie->crt_clk_enabled = false;
++}
++
++static void rtd129x_pcie_sb4_quirk(struct rtd129x_pcie *pcie)
++{
++	/* Applied by the vendor code on A00, and on RTD1296 before B00 */
++	if (pcie->revision != RTD129X_REV_A00 &&
++	    !(pcie->rtd1296 && pcie->revision != RTD129X_REV_B00))
++		return;
++
++	if (!pcie->sb4) {
++		dev_warn(pcie->dev, "no SB4 syscon, skipping revision quirk\n");
++		return;
++	}
++
++	regmap_update_bits(pcie->sb4, SB4_PCIE_CTRL14, GENMASK(2, 0), 0x1);
++	regmap_clear_bits(pcie->sb4, SB4_PCIE_MODE, pcie->slot->sb4_mode_mask);
++	regmap_update_bits(pcie->sb4, SB4_PCIE_CTRL8, GENMASK(7, 0), 0x51);
++}
++
++static void rtd129x_pcie_phy_init(struct rtd129x_pcie *pcie)
++{
++	const struct rtd129x_pcie_slot *slot = pcie->slot;
++	const u32 *seq;
++	unsigned int i, num;
++
++	if (pcie->revision < RTD129X_REV_B00) {
++		seq = slot->phy_a;
++		num = slot->num_phy_a;
++	} else {
++		seq = slot->phy_b;
++		num = slot->num_phy_b;
++	}
++
++	/* MDIO soft reset, then the tuning sequence */
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_MDIO_CTR,
++			    MDIO_CTR_SRST | MDIO_CTR_WRITE);
++	usleep_range(1000, 2000);
++
++	for (i = 0; i < num; i++) {
++		rtd129x_pcie_writel(pcie, RTD129X_PCIE_MDIO_CTR, seq[i]);
++		usleep_range(1000, 2000);
++	}
++}
++
++static void rtd129x_pcie_power_off(struct rtd129x_pcie *pcie)
++{
++	gpiod_set_value_cansleep(pcie->perst, 1);
++	reset_control_bulk_assert(RTD129X_PCIE_NUM_RESETS, pcie->resets);
++	rtd129x_pcie_clk_disable(pcie);
++}
++
++static int rtd129x_pcie_host_init(struct rtd129x_pcie *pcie)
++{
++	struct device *dev = pcie->dev;
++	u32 val;
++	int ret;
++
++	/* Hold the endpoint in reset while the root complex comes up */
++	gpiod_set_value_cansleep(pcie->perst, 1);
++
++	rtd129x_pcie_sb4_quirk(pcie);
++
++	/*
++	 * The vendor code releases the resets before ungating the clock, but
++	 * there the boot loader has usually left the clock running. Here the
++	 * gates are found off, so ungate first and let the (still asserted)
++	 * resets see a running clock before releasing them.
++	 */
++	ret = rtd129x_pcie_clk_enable(pcie);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to enable clock\n");
++	usleep_range(100, 200);
++
++	ret = reset_control_bulk_deassert(RTD129X_PCIE_NUM_RESETS, pcie->resets);
++	if (ret) {
++		rtd129x_pcie_clk_disable(pcie);
++		return dev_err_probe(dev, ret, "failed to deassert resets\n");
++	}
++
++	/* MDIO output enabled, PHY MDIO held in reset */
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_SYS_CTR, SYS_CTR_TRAN_EN |
++			    SYS_CTR_PHY_MDIO_OE | SYS_CTR_DIR_CFG_EN);
++
++	if (pcie->slot->max_gen > 1 && pcie->max_gen == 1) {
++		val = rtd129x_pcie_readl(pcie, RTD129X_PCIE_LNKCTL2);
++		val &= ~LNKCTL2_TARGET_SPEED;
++		val |= FIELD_PREP(LNKCTL2_TARGET_SPEED, 1);
++		rtd129x_pcie_writel(pcie, RTD129X_PCIE_LNKCTL2, val);
++	}
++
++	rtd129x_pcie_phy_init(pcie);
++
++	/*
++	 * Let the PHY and the reference clock settle, then release PERST#.
++	 * The vendor drivers wait here (200 ms slot 1, 100 ms slot 2) even
++	 * when they have no PERST# GPIO.
++	 */
++	msleep(pcie->slot->perst_delay_ms);
++	gpiod_set_value_cansleep(pcie->perst, 0);
++
++	/* Memory-mapped mode, indirect config access, start link training */
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_SYS_CTR, SYS_CTR_TRAN_EN |
++			    SYS_CTR_MMIO_TYPE | SYS_CTR_PHY_MDIO_OE |
++			    SYS_CTR_PHY_MDIO_RSTN | SYS_CTR_INDIR_CFG_EN |
++			    SYS_CTR_APP_LTSSM_EN);
++	msleep(50);
++
++	/* Link initial setting from the vendor code (x1, DLL link enable) */
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_PORT_LINK_CTRL, 0x00010120);
++
++	ret = read_poll_timeout(rtd129x_pcie_readl, val, val & MAC_ST_LINK_UP,
++				1000, RTD129X_PCIE_LINK_TIMEOUT_US, false,
++				pcie, RTD129X_PCIE_MAC_ST);
++	if (ret) {
++		dev_info(dev, "slot %u: link down (MAC_ST %#x: LTSSM %#lx, clk %s, PERST# %s)\n",
++			 pcie->slot->id, val, FIELD_GET(MAC_ST_LTSSM, val),
++			 val & MAC_ST_CLK_RDY ? "ready" : "not ready",
++			 pcie->perst ? "pulsed" : "not driven");
++		rtd129x_pcie_power_off(pcie);
++		return -ENODEV;
++	}
++
++	val = rtd129x_pcie_readl(pcie, RTD129X_PCIE_LNKCTL_LNKSTA) >> 16;
++	dev_info(dev, "slot %u: link up, training at Gen%u x%u\n", pcie->slot->id,
++		 (unsigned int)FIELD_GET(PCI_EXP_LNKSTA_CLS, val),
++		 (unsigned int)FIELD_GET(PCI_EXP_LNKSTA_NLW, val));
++
++	/*
++	 * A device may answer configuration requests only after
++	 * PCIE_RESET_CONFIG_WAIT_MS following link training (PCIe r6.0,
++	 * sec 6.6.1). The config accesses below poll for 1 ms with IRQs off,
++	 * so wait here instead; the ASMedia SATA controller on slot 2 is not
++	 * ready earlier.
++	 */
++	msleep(PCIE_RESET_CONFIG_WAIT_MS);
++
++	/* Bus master, memory and I/O decoding of the root complex */
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_COMMAND, PCI_COMMAND_IO |
++			    PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
++
++	/* Translated 4 KiB window (reg "cfg") -> start of the memory window */
++	pcie->win_mask = ~(u32)(SZ_4K - 1);
++	pcie->win_trans = pcie->mem->start;
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_PCI_BASE, pcie->cfg_window);
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_PCI_MASK, pcie->win_mask);
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_PCI_TRANS, pcie->win_trans);
++
++	/* Time out direct accesses instead of hanging on DLLP errors */
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_DIR_EN,
++			    FIELD_PREP(DIR_EN_TIMEOUT_CNT, 0x2000) |
++			    DIR_EN_TIMEOUT_EN);
++
++	/* Memory and prefetchable base/limit as set by the vendor code */
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_MEM_BASE_LIMIT, 0x0000fff0);
++	rtd129x_pcie_writel(pcie, RTD129X_PCIE_PREF_BASE_LIMIT, 0x0000fff0);
++
++	return 0;
++}
++
++/*
++ * Bring-up aid: SB2 0x30-0x60 are named SB2_PCI_BASE/MASK/TRAN/CTRL in the
++ * vendor header but never programmed by any vendor driver. Log them to help
++ * find out whether they control direct CPU access to the PCIe windows.
++ */
++static void rtd129x_pcie_dump_sb2(struct device *dev, struct regmap *sb2)
++{
++	u32 v[13] = { };
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(v); i++)
++		regmap_read(sb2, SB2_PCI_BASE0 + 4 * i, &v[i]);
++
++	dev_info(dev, "SB2 PCI base %08x %08x %08x %08x mask %08x %08x %08x %08x trans %08x %08x %08x %08x ctrl %08x\n",
++		 v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9],
++		 v[10], v[11], v[12]);
++}
++
++static int rtd129x_pcie_probe(struct platform_device *pdev)
++{
++	static const char * const reset_names[RTD129X_PCIE_NUM_RESETS] = {
++		/* deassertion order of the vendor code */
++		"stitch", "pcie", "core", "power", "nonstitch", "phy",
++		"phy-mdio",
++	};
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct pci_host_bridge *bridge;
++	struct resource_entry *win;
++	struct rtd129x_pcie *pcie;
++	struct regmap *sb2;
++	struct resource *res;
++	unsigned int i;
++	int ret;
++
++	bridge = devm_pci_alloc_host_bridge(dev, sizeof(*pcie));
++	if (!bridge)
++		return -ENOMEM;
++
++	pcie = pci_host_bridge_priv(bridge);
++	pcie->dev = dev;
++	raw_spin_lock_init(&pcie->lock);
++
++	pcie->slot = of_device_get_match_data(dev);
++	if (!pcie->slot)
++		return -EINVAL;
++
++	pcie->base = devm_platform_ioremap_resource_byname(pdev, "ctrl");
++	if (IS_ERR(pcie->base))
++		return PTR_ERR(pcie->base);
++
++	pcie->win_base = devm_platform_get_and_ioremap_resource(pdev, 1, &res);
++	if (IS_ERR(pcie->win_base))
++		return PTR_ERR(pcie->win_base);
++	pcie->cfg_window = res->start;
++
++	win = resource_list_first_type(&bridge->windows, IORESOURCE_MEM);
++	if (!win)
++		return dev_err_probe(dev, -EINVAL, "no memory window\n");
++	/* PCI_TRANS is programmed with CPU addresses: ranges must be 1:1 */
++	if (win->offset)
++		return dev_err_probe(dev, -EINVAL,
++				     "memory window has a CPU-to-bus offset\n");
++	pcie->mem = win->res;
++
++	sb2 = syscon_regmap_lookup_by_phandle(np, "realtek,sb2-syscon");
++	if (IS_ERR(sb2))
++		return dev_err_probe(dev, PTR_ERR(sb2), "no SB2 syscon\n");
++
++	ret = regmap_read(sb2, SB2_CHIP_REV, &pcie->revision);
++	if (ret)
++		return ret;
++
++	rtd129x_pcie_dump_sb2(dev, sb2);
++	pcie->rtd1296 = of_machine_is_compatible("realtek,rtd1296");
++
++	pcie->sb4 = syscon_regmap_lookup_by_phandle_optional(np,
++							     "realtek,sb4-syscon");
++	if (IS_ERR(pcie->sb4))
++		return dev_err_probe(dev, PTR_ERR(pcie->sb4), "bad SB4 syscon\n");
++
++	pcie->crt = syscon_regmap_lookup_by_phandle_optional(np,
++							     "realtek,crt-syscon");
++	if (IS_ERR(pcie->crt))
++		return dev_err_probe(dev, PTR_ERR(pcie->crt), "bad CRT syscon\n");
++
++	pcie->clk = devm_clk_get_optional(dev, NULL);
++	if (IS_ERR(pcie->clk))
++		return dev_err_probe(dev, PTR_ERR(pcie->clk), "bad clock\n");
++
++	for (i = 0; i < RTD129X_PCIE_NUM_RESETS; i++)
++		pcie->resets[i].id = reset_names[i];
++	ret = devm_reset_control_bulk_get_exclusive(dev, RTD129X_PCIE_NUM_RESETS,
++						    pcie->resets);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get resets\n");
++
++	pcie->perst = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
++	if (IS_ERR(pcie->perst))
++		return dev_err_probe(dev, PTR_ERR(pcie->perst),
++				     "bad reset GPIO\n");
++
++	ret = of_pci_get_max_link_speed(np);
++	pcie->max_gen = ret > 0 ? min_t(unsigned int, ret, pcie->slot->max_gen)
++				: pcie->slot->max_gen;
++
++	dev_info(dev, "slot %u, chip revision %#x%s, max Gen%u\n",
++		 pcie->slot->id, pcie->revision,
++		 pcie->rtd1296 ? " (RTD1296)" : "", pcie->max_gen);
++
++	ret = reset_control_bulk_assert(RTD129X_PCIE_NUM_RESETS, pcie->resets);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to assert resets\n");
++
++	ret = rtd129x_pcie_host_init(pcie);
++	if (ret)
++		return ret;
++
++	bridge->sysdata = pcie;
++	bridge->ops = &rtd129x_pcie_ops;
++
++	rtd129x_pcie_mmio_register(pcie, true);
++
++	ret = pci_host_probe(bridge);
++	if (ret) {
++		rtd129x_pcie_mmio_register(pcie, false);
++		rtd129x_pcie_power_off(pcie);
++		return dev_err_probe(dev, ret, "host probe failed\n");
++	}
++
++	return 0;
++}
++
++static const struct rtd129x_pcie_slot rtd1295_pcie_slot1 = {
++	.id		= 1,
++	.max_gen	= 1,
++	.crt_clk_reg	= 0x0c,
++	.crt_clk_bit	= BIT(1),
++	.sb4_mode_mask	= GENMASK(3, 0),
++	.phy_a		= rtd129x_pcie_slot1_phy_a,
++	.num_phy_a	= ARRAY_SIZE(rtd129x_pcie_slot1_phy_a),
++	.phy_b		= rtd129x_pcie_slot1_phy_b,
++	.num_phy_b	= ARRAY_SIZE(rtd129x_pcie_slot1_phy_b),
++	.perst_delay_ms	= 200,
++};
++
++static const struct rtd129x_pcie_slot rtd1295_pcie_slot2 = {
++	.id		= 2,
++	.max_gen	= 2,
++	.crt_clk_reg	= 0x10,
++	.crt_clk_bit	= BIT(5),
++	.sb4_mode_mask	= GENMASK(19, 16),
++	.phy_a		= rtd129x_pcie_slot2_phy_a,
++	.num_phy_a	= ARRAY_SIZE(rtd129x_pcie_slot2_phy_a),
++	.phy_b		= rtd129x_pcie_slot2_phy_b,
++	.num_phy_b	= ARRAY_SIZE(rtd129x_pcie_slot2_phy_b),
++	.perst_delay_ms	= 100,
++};
++
++static const struct of_device_id rtd129x_pcie_of_match[] = {
++	{ .compatible = "realtek,rtd1295-pcie-slot1", .data = &rtd1295_pcie_slot1 },
++	{ .compatible = "realtek,rtd1295-pcie-slot2", .data = &rtd1295_pcie_slot2 },
++	{ }
++};
++
++static struct platform_driver rtd129x_pcie_driver = {
++	.probe = rtd129x_pcie_probe,
++	.driver = {
++		.name = "pcie-rtd129x",
++		.of_match_table = rtd129x_pcie_of_match,
++		.suppress_bind_attrs = true,
++		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++	},
++};
++builtin_platform_driver(rtd129x_pcie_driver);

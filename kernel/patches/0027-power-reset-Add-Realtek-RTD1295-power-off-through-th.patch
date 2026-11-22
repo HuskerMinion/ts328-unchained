@@ -1,0 +1,388 @@
+From 0242efcf50d3ce2a702e85e4cb853f3fe1115091 Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 27/40] power: reset: Add Realtek RTD1295 power-off through the
+ audio CPU
+
+The RTD1295/RTD1296 vendor kernels power off by entering the audio
+CPU's "coolboot" standby. The ACPU firmware (bluecore.audio, started by
+U-Boot) then puts DDR into self refresh and powers down the SCPU side;
+wakeup is a cold boot. The wakeup sources (GPIO lines and flags) live
+in the IPC words of the RPC common area.
+
+The vendor power-off is a full suspend, and the ACPU only reacts to the
+standby request after these steps, all through big-endian IPC words:
+
+- At probe, the vendor RPC driver rings the SCPU-to-ACPU RPC interrupt
+  (SB2 0x9801a104 = RPC_INT_SA | WRITE_1) and sets audio_rpc_flag
+  (RPC common area 0xd0) to 0xffffffff.
+- In .suspend_late the RPC driver writes audio_rpc_flag = 0xdaedffff
+  and then 0xdeadffff, waiting each time for the ACPU to clear it to 0,
+  500 ms for both.
+- rtd129x_suspend.c writes the protocol version and a SCPU-authored
+  COOLBOOT notification into suspend_mask/suspend_flag (0xd4/0xd8)
+  after a full cache flush, and waits.
+
+Do the announcement at probe and again at power-off, then the RPC
+handshake, then the wakeup words and the standby request, and wait 3 s
+for the ACPU to take over. The ACPU is not coherent with the SCPU and
+writes words next to the ones written here, so the area is a no-map
+region mapped write-combined (normal non-cacheable), as in the RPC
+driver, and needs no cache maintenance. Barriers make each write
+complete before a following doorbell or poll, and keep a read from
+going ahead of earlier reads.
+
+On the QNAP TS-328 this is the step that actually switches the board
+off: QTS sends "@C0" to the MCU and then enters this standby, and the
+MCU acts only after the SoC went to standby. Sending only "@C0" with
+the SoC running leaves the board on. With "realtek,restart-on-failure",
+restart instead of returning when the ACPU does not take over; the
+TS-328 boot loader then sees the MCU in its shutdown state and
+completes the power-off.
+---
+ drivers/power/reset/Kconfig                 |  11 +
+ drivers/power/reset/Makefile                |   1 +
+ drivers/power/reset/rtd1295-acpu-poweroff.c | 300 ++++++++++++++++++++
+ 3 files changed, 312 insertions(+)
+ create mode 100644 drivers/power/reset/rtd1295-acpu-poweroff.c
+
+diff --git a/drivers/power/reset/Kconfig b/drivers/power/reset/Kconfig
+index 8248895ca..46b454d25 100644
+--- a/drivers/power/reset/Kconfig
++++ b/drivers/power/reset/Kconfig
+@@ -212,6 +212,17 @@ config POWER_RESET_REGULATOR
+ 	  This driver supports turning off your board by disabling a
+ 	  power regulator defined in the devicetree.
+ 
++config POWER_RESET_RTD1295_ACPU
++	bool "Realtek RTD1295 power-off through the audio CPU"
++	depends on ARCH_REALTEK || COMPILE_TEST
++	depends on ARM64 && OF
++	select MFD_SYSCON
++	help
++	  Power off Realtek RTD1295/RTD1296 boards by asking the audio CPU
++	  firmware to put the SoC into its "coolboot" standby, as the vendor
++	  kernels do. Boards whose power controller waits for the SoC to go
++	  to standby (QNAP TS-328) need this to switch off.
++
+ config POWER_RESET_RESTART
+ 	bool "Restart power-off driver"
+ 	help
+diff --git a/drivers/power/reset/Makefile b/drivers/power/reset/Makefile
+index 51da87e05..209d5ccb0 100644
+--- a/drivers/power/reset/Makefile
++++ b/drivers/power/reset/Makefile
+@@ -23,6 +23,7 @@ obj-$(CONFIG_POWER_RESET_PIIX4_POWEROFF) += piix4-poweroff.o
+ obj-$(CONFIG_POWER_RESET_LTC2952) += ltc2952-poweroff.o
+ obj-$(CONFIG_POWER_RESET_QNAP) += qnap-poweroff.o
+ obj-$(CONFIG_POWER_RESET_REGULATOR) += regulator-poweroff.o
++obj-$(CONFIG_POWER_RESET_RTD1295_ACPU) += rtd1295-acpu-poweroff.o
+ obj-$(CONFIG_POWER_RESET_RESTART) += restart-poweroff.o
+ obj-$(CONFIG_POWER_RESET_ST) += st-poweroff.o
+ obj-$(CONFIG_POWER_RESET_TH1520_AON) += th1520-aon-reboot.o
+diff --git a/drivers/power/reset/rtd1295-acpu-poweroff.c b/drivers/power/reset/rtd1295-acpu-poweroff.c
+new file mode 100644
+index 000000000..84f82b554
+--- /dev/null
++++ b/drivers/power/reset/rtd1295-acpu-poweroff.c
+@@ -0,0 +1,300 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Realtek RTD1295/RTD1296 power-off through the audio CPU (ACPU)
++ *
++ * On these SoCs the audio CPU firmware (bluecore.audio, started by the
++ * boot loader) owns the low-power states. The vendor kernels power off by
++ * asking it to enter "coolboot" standby: the SCPU writes a request into
++ * the IPC area of the RPC shared memory and waits; the ACPU firmware then
++ * puts DDR into self refresh and powers down the SCPU side. Wakeup is a
++ * cold boot through the boot loader.
++ *
++ * Boards with a power-management MCU (QNAP TS-328) need this as the last
++ * step: the MCU is told to cut the power first, and does so only once the
++ * SoC is in standby.
++ *
++ * Sequence, register layout and values from the QNAP 4.2.8 GPL kernel.
++ * The vendor power-off is a full suspend in "coolboot" mode, and the ACPU
++ * reacts to two shared-memory handshakes, no interrupt:
++ *
++ *  1. RPC driver, .suspend_late (RPCDriver.c venus_rpc_pm_suspend):
++ *     audio_rpc_flag = 0xdaedffff ("stop audio HAS_CHECK"), wait for the
++ *     ACPU to clear it, then audio_rpc_flag = 0xdeadffff ("wait audio RPC
++ *     suspend ready"), wait again; 500 ms for both together.
++ *  2. Platform suspend (rtd129x_suspend.c rtk_iso_suspend): flush the
++ *     caches, suspend_mask = version 2, suspend_flag = SCPU | COOLBOOT,
++ *     then spin. The ACPU firmware logs "[ACPU] suspend
++ *     PLATFORM_HANDSHAKE_ADDR 0x40000002", shuts its audio blocks down and
++ *     enters "suspend_core".
++ *
++ * All IPC words are big endian.
++ *
++ * Before any of that, the vendor RPC driver announces the SCPU side at
++ * probe: it rings the SCPU-to-ACPU RPC interrupt (SB2 0x104, RPC_INT_SA |
++ * WRITE_1) and sets audio_rpc_flag = 0xffffffff. Without an RPC driver
++ * nobody does that, and the ACPU never reacts to the handshakes above, so
++ * this driver does the same at probe and again at power-off.
++ *
++ * If the ACPU does not take over, a board can ask for a restart instead
++ * ("realtek,restart-on-failure"). On the TS-328 the boot loader then finds
++ * the MCU in its shutdown state and finishes the power-off itself.
++ */
++
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/mfd/syscon.h>
++#include <linux/mod_devicetable.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/reboot.h>
++#include <linux/regmap.h>
++
++/* Offsets in the RPC common area (rpc@1f000) */
++#define ACPU_IPC_AUDIO_RPC_FLAG		0xd0
++#define ACPU_IPC_SUSPEND_MASK		0xd4
++#define ACPU_IPC_SUSPEND_FLAG		0xd8
++#define ACPU_IPC_WAKEUP_FLAGS		0x114
++#define ACPU_IPC_GPIO_WAKEUP_EN		0x11c	/* ISO GPIO 0-23 */
++#define ACPU_IPC_GPIO_WAKEUP_ACT	0x120
++#define ACPU_IPC_GPIO_WAKEUP_EN2	0x140	/* ISO GPIO 24-34 */
++#define ACPU_IPC_GPIO_WAKEUP_ACT2	0x144
++#define ACPU_IPC_END			0x150
++
++/* suspend_mask: protocol version 2 in bits [31:16] */
++#define ACPU_SUSPEND_VERSION		(2 << 16)
++/* suspend_flag: author in [31:30], notification in [7:0] */
++#define ACPU_AUTHOR_SCPU		(1 << 30)
++#define ACPU_NOTIFY_COOLBOOT		0x02
++
++/* The other words carry a magic key in [31:24] */
++#define ACPU_MAGIC			(0xeaU << 24)
++#define ACPU_WAKEUP_ON_LAN		BIT(0)
++#define ACPU_WAKEUP_ON_IR		BIT(1)
++#define ACPU_WAKEUP_ON_GPIO		BIT(2)
++#define ACPU_WAKEUP_ON_ALARM		BIT(3)
++#define ACPU_WAKEUP_ON_CEC		BIT(5)
++
++#define ACPU_ISO_GPIO_LOW_NUM		24
++#define ACPU_ISO_GPIO_NUM		35
++
++/* SB2 RPC interrupt register (0x9801a104), SCPU to ACPU doorbell */
++#define SB2_RPC_INT			0x104
++#define SB2_RPC_INT_SA			BIT(1)
++#define SB2_RPC_INT_WRITE_1		BIT(0)
++
++/* audio_rpc_flag: SCPU RPC up */
++#define ACPU_RPC_READY			0xffffffff
++/* audio_rpc_flag requests, cleared to 0 by the ACPU */
++#define ACPU_RPC_STOP_HAS_CHECK		0xdaedffff
++#define ACPU_RPC_SUSPEND_READY		0xdeadffff
++#define ACPU_RPC_TIMEOUT_MS		500
++#define ACPU_ANNOUNCE_WAIT_MS		100
++
++/* Time for the ACPU to power down the SCPU side */
++#define ACPU_POWER_OFF_WAIT_MS		3000
++
++struct rtd1295_acpu_poweroff {
++	struct device *dev;
++	void *ipc;
++	size_t size;
++	struct regmap *sb2;
++	u32 wake_en, wake_act, wake_en2, wake_act2;
++	bool restart_on_failure;
++};
++
++/*
++ * The ACPU is not cache coherent with the SCPU. The IPC area is a no-map
++ * region mapped write-combined (normal non-cacheable), as in the RPC
++ * driver: no cacheable alias, and a write only touches its own word. The
++ * barriers order the accesses as the cache maintenance used to.
++ */
++static void acpu_write(struct rtd1295_acpu_poweroff *ap, unsigned int off,
++		       u32 val)
++{
++	WRITE_ONCE(*(__be32 *)(ap->ipc + off), cpu_to_be32(val));
++	/* in memory before a following doorbell write or poll */
++	wmb();
++}
++
++static u32 acpu_read(struct rtd1295_acpu_poweroff *ap, unsigned int off)
++{
++	/* not ahead of earlier reads */
++	rmb();
++	return be32_to_cpu(READ_ONCE(*(__be32 *)(ap->ipc + off)));
++}
++
++/* What the vendor RPC driver does at probe: ring the ACPU, mark RPC up */
++static void acpu_announce(struct rtd1295_acpu_poweroff *ap)
++{
++	regmap_write(ap->sb2, SB2_RPC_INT, SB2_RPC_INT_SA | SB2_RPC_INT_WRITE_1);
++	acpu_write(ap, ACPU_IPC_AUDIO_RPC_FLAG, ACPU_RPC_READY);
++}
++
++/* Returns the time left of *budget_ms, or a negative value on timeout */
++static int acpu_rpc_request(struct rtd1295_acpu_poweroff *ap, u32 req,
++			    int *budget_ms)
++{
++	int waited = 0;
++
++	acpu_write(ap, ACPU_IPC_AUDIO_RPC_FLAG, req);
++	while (acpu_read(ap, ACPU_IPC_AUDIO_RPC_FLAG) != 0) {
++		if (*budget_ms <= 0) {
++			pr_emerg("rtd1295-acpu-poweroff: no ACK for RPC flag %08x (reads %08x)\n",
++				 req, acpu_read(ap, ACPU_IPC_AUDIO_RPC_FLAG));
++			return -ETIMEDOUT;
++		}
++		mdelay(1);
++		waited++;
++		(*budget_ms)--;
++	}
++
++	pr_emerg("rtd1295-acpu-poweroff: RPC flag %08x acknowledged after %d ms\n",
++		 req, waited);
++	return 0;
++}
++
++static int rtd1295_acpu_power_off(struct sys_off_data *data)
++{
++	struct rtd1295_acpu_poweroff *ap = data->cb_data;
++	int budget = ACPU_RPC_TIMEOUT_MS;
++
++	pr_emerg("rtd1295-acpu-poweroff: audio RPC flag %08x, suspend flag %08x\n",
++		 acpu_read(ap, ACPU_IPC_AUDIO_RPC_FLAG),
++		 acpu_read(ap, ACPU_IPC_SUSPEND_FLAG));
++
++	/* In case the ACPU missed the announcement at probe */
++	acpu_announce(ap);
++	mdelay(ACPU_ANNOUNCE_WAIT_MS);
++
++	/*
++	 * Step 1, RPC suspend handshake. The vendor kernel goes on after a
++	 * timeout, so do the same.
++	 */
++	if (!acpu_rpc_request(ap, ACPU_RPC_STOP_HAS_CHECK, &budget))
++		acpu_rpc_request(ap, ACPU_RPC_SUSPEND_READY, &budget);
++
++	/* Wakeup sources, as the vendor kernel sets them at boot */
++	acpu_write(ap, ACPU_IPC_WAKEUP_FLAGS, ACPU_MAGIC |
++		   ACPU_WAKEUP_ON_LAN | ACPU_WAKEUP_ON_IR |
++		   ACPU_WAKEUP_ON_GPIO | ACPU_WAKEUP_ON_ALARM |
++		   ACPU_WAKEUP_ON_CEC);
++	acpu_write(ap, ACPU_IPC_GPIO_WAKEUP_EN, ACPU_MAGIC | ap->wake_en);
++	acpu_write(ap, ACPU_IPC_GPIO_WAKEUP_ACT, ACPU_MAGIC | ap->wake_act);
++	acpu_write(ap, ACPU_IPC_GPIO_WAKEUP_EN2, ACPU_MAGIC | ap->wake_en2);
++	acpu_write(ap, ACPU_IPC_GPIO_WAKEUP_ACT2, ACPU_MAGIC | ap->wake_act2);
++
++	/*
++	 * Step 2, the standby request itself. The vendor kernel flushes the
++	 * caches first; the IPC words above already are in memory.
++	 */
++	acpu_write(ap, ACPU_IPC_SUSPEND_MASK, ACPU_SUSPEND_VERSION);
++	acpu_write(ap, ACPU_IPC_SUSPEND_FLAG,
++		   ACPU_AUTHOR_SCPU | ACPU_NOTIFY_COOLBOOT);
++	dsb(sy);
++
++	pr_emerg("rtd1295-acpu-poweroff: requested ACPU standby\n");
++
++	/*
++	 * Like the vendor kernel, just wait: the ACPU powers down the SCPU
++	 * side, which ends this loop.
++	 */
++	mdelay(ACPU_POWER_OFF_WAIT_MS);
++
++	dev_emerg(ap->dev, "ACPU did not take over (RPC flag %08x, suspend flag %08x)\n",
++		  acpu_read(ap, ACPU_IPC_AUDIO_RPC_FLAG),
++		  acpu_read(ap, ACPU_IPC_SUSPEND_FLAG));
++
++	if (ap->restart_on_failure) {
++		dev_emerg(ap->dev, "restarting, the boot loader completes the power-off\n");
++		do_kernel_restart(NULL);
++		dev_emerg(ap->dev, "restart failed\n");
++	}
++
++	return NOTIFY_DONE;
++}
++
++static int rtd1295_acpu_poweroff_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct rtd1295_acpu_poweroff *ap;
++	struct reserved_mem *rmem;
++	struct device_node *np;
++	int i, n;
++
++	ap = devm_kzalloc(dev, sizeof(*ap), GFP_KERNEL);
++	if (!ap)
++		return -ENOMEM;
++	ap->dev = dev;
++
++	np = of_parse_phandle(dev->of_node, "memory-region", 0);
++	if (!np)
++		return dev_err_probe(dev, -EINVAL, "no memory-region\n");
++	rmem = of_reserved_mem_lookup(np);
++	of_node_put(np);
++	if (!rmem || rmem->size < ACPU_IPC_END)
++		return dev_err_probe(dev, -EINVAL, "invalid memory-region\n");
++
++	/* RAM shared with the ACPU: no-map in the DT, not cacheable here */
++	ap->size = ACPU_IPC_END;
++	ap->ipc = devm_memremap(dev, rmem->base, ap->size, MEMREMAP_WC);
++	if (IS_ERR(ap->ipc))
++		return dev_err_probe(dev, PTR_ERR(ap->ipc),
++				     "cannot map the IPC area\n");
++
++	ap->sb2 = syscon_regmap_lookup_by_phandle(dev->of_node, "realtek,sb2");
++	if (IS_ERR(ap->sb2))
++		return dev_err_probe(dev, PTR_ERR(ap->sb2), "no SB2 syscon\n");
++
++	n = of_property_count_u32_elems(dev->of_node,
++					"realtek,wakeup-iso-lines");
++	for (i = 0; i < n; i++) {
++		u32 gpio;
++
++		of_property_read_u32_index(dev->of_node,
++					   "realtek,wakeup-iso-lines", i, &gpio);
++		if (gpio >= ACPU_ISO_GPIO_NUM) {
++			dev_warn(dev, "ignoring wakeup ISO GPIO %u\n", gpio);
++			continue;
++		}
++		if (gpio < ACPU_ISO_GPIO_LOW_NUM) {
++			ap->wake_en |= BIT(gpio);
++			ap->wake_act |= BIT(gpio);
++		} else {
++			ap->wake_en2 |= BIT(gpio - ACPU_ISO_GPIO_LOW_NUM);
++			ap->wake_act2 |= BIT(gpio - ACPU_ISO_GPIO_LOW_NUM);
++		}
++	}
++	ap->restart_on_failure = of_property_read_bool(dev->of_node,
++						"realtek,restart-on-failure");
++
++	if (of_property_read_bool(dev->of_node, "realtek,wakeup-active-low")) {
++		ap->wake_act = 0;
++		ap->wake_act2 = 0;
++	}
++
++	acpu_announce(ap);
++	dev_info(dev, "audio RPC flag %08x, suspend flag %08x\n",
++		 acpu_read(ap, ACPU_IPC_AUDIO_RPC_FLAG),
++		 acpu_read(ap, ACPU_IPC_SUSPEND_FLAG));
++
++	return devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF,
++					     SYS_OFF_PRIO_DEFAULT,
++					     rtd1295_acpu_power_off, ap);
++}
++
++static const struct of_device_id rtd1295_acpu_poweroff_of_match[] = {
++	{ .compatible = "realtek,rtd1295-acpu-poweroff" },
++	{ /* sentinel */ }
++};
++
++static struct platform_driver rtd1295_acpu_poweroff_driver = {
++	.probe = rtd1295_acpu_poweroff_probe,
++	.driver = {
++		.name = "rtd1295-acpu-poweroff",
++		.of_match_table = rtd1295_acpu_poweroff_of_match,
++		.suppress_bind_attrs = true,
++	},
++};
++builtin_platform_driver(rtd1295_acpu_poweroff_driver);

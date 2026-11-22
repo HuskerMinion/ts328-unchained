@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The root file system is mounted read-write by the stage-1 initrd
+# (noatime, errors=remount-ro), so it has no entry here.
+# <file system> <mount point> <type> <options> <dump> <pass>

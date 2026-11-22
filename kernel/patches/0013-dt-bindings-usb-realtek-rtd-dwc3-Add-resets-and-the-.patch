@@ -1,0 +1,59 @@
+From 7e1f4c3732ff4883d4b13b0e45ee1964ec6cc4bc Mon Sep 17 00:00:00 2001
+From: HuskerMinion <28571744+HuskerMinion@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:00:00 +0000
+Subject: [PATCH 13/40] dt-bindings: usb: realtek,rtd-dwc3: Add resets and the
+ RTD1295 USB clock
+
+On RTD1295 the wrapper, the USB PHYs and the DWC3 MAC are held in reset
+by the CRT block until software releases them, and the boot loader
+does not always do so. Allow the glue node to list these resets so that
+the driver can release them, in order, before it touches the wrapper
+registers.
+
+The common USB clock gate (CRT 0x0c bit 4) is only enabled when the
+boot loader used USB itself, and the vendor sequence requires it to be
+pulsed while the controller is still in reset. Describe it with
+"realtek,usb-clock": the CRT syscon, the register offset, the bit, and
+the number of leading (PHY) resets that are released before the clock
+pulse.
+---
+ .../bindings/usb/realtek,rtd-dwc3.yaml        | 26 +++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/usb/realtek,rtd-dwc3.yaml b/Documentation/devicetree/bindings/usb/realtek,rtd-dwc3.yaml
+index 345d0132d..1ab0f2542 100644
+--- a/Documentation/devicetree/bindings/usb/realtek,rtd-dwc3.yaml
++++ b/Documentation/devicetree/bindings/usb/realtek,rtd-dwc3.yaml
+@@ -40,6 +40,32 @@ properties:
+ 
+   ranges: true
+ 
++  resets:
++    minItems: 1
++    maxItems: 9
++    description:
++      Resets of the wrapper, the USB PHYs and the controller, released in the
++      order given before the wrapper is accessed. The RTD1295 vendor sequence
++      releases the USB PHY resets of all ports before the USB3 PHY MDIO
++      resets and the common USB reset, so each controller can list the whole
++      set.
++
++  realtek,usb-clock:
++    $ref: /schemas/types.yaml#/definitions/phandle-array
++    items:
++      - items:
++          - description: phandle to the CRT syscon
++          - description: offset of the clock enable register
++          - description: bit of the common USB clock gate
++          - description:
++              number of leading resets (the PHY resets) released before the
++              clock is pulsed; the remaining resets are released with the
++              clock off, and the clock is enabled afterwards
++    description:
++      Common USB clock gate in the CRT block (RTD1295). The boot loader only
++      enables it when it used USB itself, and the vendor sequence requires it
++      to be pulsed while the controller is still in reset.
++
+ patternProperties:
+   "^usb@[0-9a-f]+$":
+     $ref: snps,dwc3.yaml#

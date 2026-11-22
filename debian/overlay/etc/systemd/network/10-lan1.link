@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Match]
+Path=platform-9804e000.pcie-pci-0000:00:00.0
+
+[Link]
+Name=lan1
