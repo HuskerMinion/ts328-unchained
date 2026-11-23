@@ -13,9 +13,14 @@
 set -eu
 DATA=${1:-/srv/data}
 LIMIT_MIB=${LIMIT_MIB:-1024}
-STATE=/var/lib/ts328/emmc-writes.last
+STATE=/var/lib/ts328/emmc-writes.last	# in RAM with a read-only root in RAM mode: that boot is not metered
 
-dev=$(findmnt -no SOURCE /); dev=${dev#/dev/}
+dev=$(findmnt -no SOURCE /)
+# read-only root (ts328-overlay): the eMMC root is the lower layer
+if [ "$(findmnt -no FSTYPE /)" = overlay ]; then
+	dev=$(findmnt -no SOURCE /media/root-ro) || { echo "read-only root, but /media/root-ro is not mounted"; exit 0; }
+fi
+dev=${dev#/dev/}
 case $dev in mmcblk0*) ;; *) echo "root is on $dev, not the eMMC: nothing to measure"; exit 0;; esac
 now_kib=$(cat /sys/fs/ext4/"$dev"/lifetime_write_kbytes)
 now_t=$(date +%s)

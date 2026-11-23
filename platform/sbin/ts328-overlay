@@ -1,0 +1,183 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Read-only root for the TS-328. When enabled, stage 1 mounts the eMMC root
+# read-only as the lower layer of an overlay; every change (updates, settings,
+# logs) goes to a directory on the data volume instead, so the eMMC is not
+# written at all. If the data volume is missing at boot, changes go to RAM for
+# that boot only and the box still starts.
+#
+#   ts328-overlay status
+#   ts328-overlay enable [/srv/data]   switch to the read-only root at the next boot
+#   ts328-overlay disable              copy the changes onto the eMMC once and go back
+#                                      to the normal writable root at the next boot
+#   ts328-overlay disable --discard    go back without copying the changes
+#   ts328-overlay reset                drop all changes at the next boot (back to the
+#                                      eMMC root as it was when the overlay was enabled)
+set -eu
+CONF=/etc/ts328-overlay.conf
+STATE=/etc/ts328-overlay.state
+LOWER=/media/root-ro
+
+die() { echo "ts328-overlay: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "run as root"
+fstype() { findmnt -no FSTYPE "$1" 2>/dev/null || :; }
+val() { sed -n "s/^$1=//p" "${2:-$CONF}" 2>/dev/null | head -1; }
+state() { cat $STATE 2>/dev/null || echo unknown; }
+# the overlay directory on the data volume, from the conf
+overlay_dir() {
+	d=$(val DATA_MOUNT); r=$(val DIR)
+	[ -n "$d" ] && [ -n "$r" ] || die "$CONF is missing or incomplete"
+	echo "$d/$r"
+}
+# root-owned and not writable by group or others (stage 1 checks the same)
+root_only() {
+	[ -d "$1" ] && [ ! -L "$1" ] || return 1
+	set -- $(stat -c '%u %a' "$1")
+	[ "$1" = 0 ] || return 1
+	case $2 in *[2367]? | *[2367]) return 1;; esac
+}
+# (not unattended-upgrade-shutdown, which waits for a shutdown all the time)
+busy_apt() { pgrep -x 'apt(-get)?|dpkg' >/dev/null || pgrep -f '^/usr/bin/python3 /usr/bin/unattended-upgrade' >/dev/null; }
+
+case ${1:-status} in
+status)
+	if [ "$(fstype /)" = overlay ]; then
+		echo "Root: read-only eMMC ($(findmnt -no SOURCE $LOWER)) with an overlay."
+		case $(state) in
+		data)	up="$(overlay_dir)/upper"
+			echo "Changes: on the data volume, $(du -sh "$up" 2>/dev/null | cut -f1) in $up"
+			[ -e "$(overlay_dir)/reset" ] && echo "A reset is scheduled: the next boot drops all changes.";;
+		ram)	echo "Changes: in RAM for this boot only (the data volume was not usable at boot;"
+			echo "see: journalctl -k | grep stage1).";;
+		*)	echo "Changes: unknown ($STATE is missing).";;
+		esac
+		grep -qx 'OVERLAY=1' $LOWER$CONF 2>/dev/null ||
+			echo "Disabled: the next boot uses the normal writable root."
+	else
+		echo "Root: normal, writable ($(findmnt -no SOURCE /))."
+		if grep -qx 'OVERLAY=1' $CONF 2>/dev/null; then
+			if [ "$(state)" = failed ]; then
+				echo "The read-only root is enabled, but it failed at the last boot"
+				echo "(see: journalctl -k | grep stage1)."
+			else
+				echo "The read-only root starts at the next boot."
+			fi
+		fi
+	fi
+	;;
+enable)
+	[ "$(fstype /)" = ext4 ] || die "the root is not the normal eMMC root"
+	case $(findmnt -no SOURCE /) in /dev/mmcblk0*) ;; *) die "the root is not on the eMMC";; esac
+	data=${2:-/srv/data}
+	case $data in /srv/?* | /mnt/?*) ;; *) die "the data volume must be mounted under /srv or /mnt";; esac
+	printf '%s' "$data" | grep -qx '/[A-Za-z0-9._/-]\{1,100\}' || die "use a mount point made of letters, digits and . _ - /"
+	case "$data/" in */../* | */./* | *//*) die "$data: use a plain path";; esac
+	findmnt -n "$data" >/dev/null || die "$data is not a mounted file system"
+	[ "$(findmnt -no TARGET "$data")" = "$data" ] || die "$data is not a mount point"
+	[ "$(fstype "$data")" = ext4 ] || die "$data is $(fstype "$data"); the read-only root needs an ext4 data volume"
+	src=$(findmnt -no SOURCE "$data")
+	case $src in
+	/dev/md*)
+		md_uuid=$(mdadm --detail --export "$src" | sed -n 's/^MD_UUID=//p')
+		[ -n "$md_uuid" ] || die "cannot read the array UUID of $src"
+		grep -q "^ARRAY.*UUID=$md_uuid" /etc/mdadm/mdadm.conf 2>/dev/null ||
+			die "add the RAID to /etc/mdadm/mdadm.conf first (mdadm --detail --scan >> /etc/mdadm/mdadm.conf)";;
+	/dev/sd[a-z]*[0-9])
+		case $(readlink -f /sys/class/block/${src#/dev/}) in */usb*) die "$data is on a USB disk; use an internal disk";; esac
+		! grep -q '^ARRAY' /etc/mdadm/mdadm.conf 2>/dev/null ||
+			die "mdadm.conf lists a RAID, so stage 1 only looks for the data volume on md devices";;
+	*)	die "$data is on $src; the read-only root needs an md RAID or a partition of an internal SATA disk";;
+	esac
+	uuid=$(findmnt -no UUID "$data"); [ -n "$uuid" ] || die "no file system UUID for $data"
+	root_only "$data" || die "$data must be owned by root and not writable by group or others"
+	[ ! -e "$data/system" ] || root_only "$data/system" ||
+		die "$data/system must be owned by root and not writable by group or others"
+	if [ -d /var/lib/containers ] && ! mountpoint -q /var/lib/containers &&
+	   [ -n "$(ls -A /var/lib/containers 2>/dev/null)" ]; then
+		die "Podman storage is on the root; run ts328-offload-writes first (an overlay cannot hold it)"
+	fi
+	rootuuid=$(findmnt -no UUID /)
+	dir=system/root-overlay/$rootuuid
+	install -d -m 755 -o 0 -g 0 "$data/system"
+	install -d -m 700 -o 0 -g 0 "$data/system/root-overlay" "$data/$dir"
+	chmod 700 "$data/system/root-overlay" "$data/$dir"
+	# Changes from an earlier overlay belong to an older eMMC root: after a
+	# disable they were copied or discarded (reset flag), else keep them aside.
+	if [ -e "$data/$dir/reset" ]; then
+		rm -rf "$data/$dir/upper" "$data/$dir/work" "$data/$dir/reset"
+	fi
+	if [ -n "$(ls -A "$data/$dir" 2>/dev/null)" ]; then
+		old=$data/$dir.old-$(date +%Y%m%d-%H%M%S)
+		mv "$data/$dir" "$old"
+		install -d -m 700 -o 0 -g 0 "$data/$dir"
+		echo "Earlier overlay changes moved to $old (delete it when not needed)."
+	fi
+	printf 'OVERLAY=1\nDATA_UUID=%s\nDATA_MOUNT=%s\nDIR=%s\n' "$uuid" "$data" "$dir" > $CONF
+	rm -f $STATE
+	sync
+	echo "Read-only root enabled. Reboot to switch; changes will be kept in $data/$dir."
+	echo "Stage 1 reads /etc/mdadm/mdadm.conf from the eMMC: changes to it after this"
+	echo "point are not seen at boot (disable, edit, enable)."
+	;;
+disable)
+	opt=${2:-}
+	case $opt in "" | --discard) ;; *) die "unknown option: $opt (only --discard)";; esac
+	if [ "$(fstype /)" != overlay ]; then
+		if [ -e $CONF ]; then rm -f $CONF $STATE; echo "Canceled: the next boot uses the normal writable root."
+		else echo "The root is not read-only; nothing to do."; fi
+		exit 0
+	fi
+	lowerdev=$(findmnt -no SOURCE $LOWER) || die "$LOWER is not mounted"
+	if [ -z "$opt" ]; then
+		[ "$(state)" = data ] || die "the data volume was not usable at this boot, so the changes on it
+are not visible now and would be lost. Fix it and reboot first, or use --discard."
+		command -v rsync >/dev/null || die "install rsync first (apt install rsync), or use --discard"
+		busy_apt && die "apt or dpkg is running; try again when it has finished"
+		need=$(du -skx "$(overlay_dir)/upper" | cut -f1)
+		free=$(df -k --output=avail $LOWER | tail -1)
+		[ "$need" -lt "$free" ] || die "the changes ($need KiB) may not fit on the eMMC ($free KiB free)"
+		systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || :
+	fi
+	trap 'mount -o remount,ro $LOWER 2>/dev/null; blockdev --setro $lowerdev
+	      echo "ts328-overlay: disable failed; the read-only root stays enabled" >&2' EXIT
+	trap 'exit 1' HUP INT TERM
+	blockdev --setrw "$lowerdev"
+	mount -o remount,rw $LOWER
+	if [ -z "$opt" ]; then
+		echo "Copying the changes onto the eMMC (once)..."
+		# -x: only the root itself (not /proc, the data volume, $LOWER, ...)
+		rsync -aHAXx --delete --exclude=$STATE --exclude=$CONF / $LOWER/
+	fi
+	rm -f $LOWER$CONF $LOWER$STATE
+	sync
+	trap - EXIT HUP INT TERM
+	mount -o remount,ro $LOWER
+	blockdev --setro "$lowerdev"
+	if [ "$(state)" = data ]; then touch "$(overlay_dir)/reset"; fi
+	echo "Done. Reboot now to use the normal writable root; changes made before"
+	echo "the reboot are not copied."
+	;;
+reset)
+	[ "$(fstype /)" = overlay ] || die "the root is not read-only"
+	od=$(overlay_dir)
+	if [ "$(state)" != data ]; then
+		# RAM mode: the data volume may have been mounted later by the system
+		if [ "$(findmnt -no UUID "$(val DATA_MOUNT)" 2>/dev/null)" = "$(val DATA_UUID)" ] && [ -d "$od" ]; then
+			touch "$od/reset"
+			echo "This boot's changes are in RAM and go away at the reboot; the changes kept"
+			echo "on the data volume are dropped at the next boot that uses it."
+		else
+			echo "This boot's changes are in RAM and go away at the reboot. The data volume"
+			echo "is not mounted, so no reset of the changes kept on it is scheduled."
+		fi
+		exit 0
+	fi
+	touch "$od/reset"
+	echo "At the next boot all changes are dropped: the root starts as it was when the overlay was enabled."
+	;;
+*)
+	sed -n '2,/^set -eu/p' "$0" | sed '$d; s/^# \{0,1\}//'
+	exit 2
+	;;
+esac

@@ -48,7 +48,7 @@ OVERLAY_FIX="for p in $OVL_PATHS; do chown -h 0:0 \"\$1\$p\" && if [ -d \"\$1\$p
 
 mmdebstrap --mode=unshare --arch=arm64 --variant=important \
   --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
-  --include=systemd-sysv,udev,systemd-resolved,openssh-server,sudo,mdadm,smartmontools,kmod,e2fsprogs,iproute2,iputils-ping,ca-certificates,nano,less,curl,unattended-upgrades,python3-gi,systemd-timesyncd,bash-completion,alsa-utils,locales,apparmor \
+  --include=systemd-sysv,udev,systemd-resolved,openssh-server,sudo,mdadm,smartmontools,kmod,e2fsprogs,iproute2,iputils-ping,ca-certificates,nano,less,curl,unattended-upgrades,python3-gi,systemd-timesyncd,bash-completion,alsa-utils,locales,apparmor,rsync \
   --components=main --aptopt='APT::Install-Recommends "false"' \
   --customize-hook='sync-in overlay /' \
   --customize-hook="$OVERLAY_FIX" \

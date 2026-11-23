@@ -64,7 +64,7 @@ this boot clones the whole stick onto the eMMC.)
 | `kernel/patches/` | the patch series on top of Linux v6.18.64 (`git am`) |
 | `kernel/configs/` | config fragments, merged on top of `allnoconfig` |
 | `kernel/build.sh` | clone, patch, configure, build and package |
-| `stage1/` | stage-1 initrd (busybox) and its build script |
+| `stage1/` | stage-1 initrd (busybox, plus mdadm for the optional read-only root) and its build script |
 | `debian/` | rootless Debian 12 root filesystem build (mmdebstrap) |
 | `platform/` | front panel, fan, RAID event and voice-prompt tools and systemd units |
 | `tools/` | `mkboot.sh` (boot set packaging); `emmc-boot1-test.c` (development test that writes the eMMC boot1 area; not needed for installation) |
@@ -114,9 +114,11 @@ kernel's licensing: each new file carries its own SPDX-License-Identifier
 device tree bindings).
 
 Binary releases: a kernel built from this repository is Linux v6.18.64 plus
-`kernel/patches` at the same tag. `initrd.boot` contains Debian's
-busybox-static 1.35.0-4+deb12u1+b1, whose source is at
-https://snapshot.debian.org/package/busybox/1.35.0-4%2Bdeb12u1/. The audio
+`kernel/patches` at the same tag. `initrd.boot` contains these Debian
+packages: busybox-static 1.35.0-4+deb12u1+b1, mdadm 4.2-5, libudev1
+252.39-1~deb12u2 and libc6 2.36-9+deb12u14. Their source is at
+https://snapshot.debian.org/package/<name>/<version>/ (busybox:
+https://snapshot.debian.org/package/busybox/1.35.0-4%2Bdeb12u1/). The audio
 CPU firmware (`bluecore.audio`) is not distributed; copy it from your own
 device.
 

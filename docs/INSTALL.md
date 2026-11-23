@@ -251,10 +251,60 @@ writes are batched (at most 60 s of changes are lost on a power cut).
 Keep big or busy things (downloads, virtual machines, rootless containers)
 on `/srv/data`, not in home folders, which are on the eMMC.
 
+### 6.3 Optional: read-only root (no eMMC writes at all)
+
+With this on, stage 1 mounts the eMMC root read-only and puts an overlay
+on top: every change (package updates, settings, Samba users, logs) is
+written to `/srv/data/system/root-overlay/` on the data volume instead.
+The eMMC is then not written during normal operation.
+
+Needs the `initrd.boot` from v1.1.0 or later on partition 2 (rebuild it
+with `stage1/build.sh` and copy it with its `.cksum` as in 4.3) and
+`ts328-overlay` installed as in step 5. Images built from v1.1.0 on also
+contain `rsync`, which `disable` needs; on older installs run
+`apt install rsync`.
+
+```sh
+grep -q ^ARRAY /etc/mdadm/mdadm.conf || mdadm --detail --scan >> /etc/mdadm/mdadm.conf
+ts328-overlay enable /srv/data
+reboot
+ts328-overlay status
+```
+
+- The data volume must be ext4 on an md RAID or on an internal SATA
+  partition (not USB), mounted under `/srv` or `/mnt`. `/srv/data` and
+  `/srv/data/system` must be owned by root and not writable by group or
+  others; stage 1 checks this at every boot, so a share user cannot put
+  files into the root. Share subfolders of `/srv/data`, not `/srv/data`
+  itself.
+- Stage 1 reads `/etc/mdadm/mdadm.conf` from the eMMC. Edit it before
+  enabling; later changes go to the overlay and are not seen at boot.
+- At boot, stage 1 waits up to about 30 s for all RAID disks; it starts the
+  array degraded only when a disk is still missing after 25 s.
+- If the data volume cannot be used at boot, the box still starts, with
+  changes kept in RAM for that boot only. Do not update or change settings
+  then: a reboot drops them. `ts328-overlay status` says which mode is
+  active, and `journalctl -k | grep stage1` says why.
+- `ts328-overlay reset` drops all changes at the next boot: back to the
+  root as it was when the overlay was enabled.
+- `ts328-overlay disable` copies the changes onto the eMMC once and returns
+  to the normal writable root at the next boot; `disable --discard` returns
+  without copying. Running it now and then (then `enable` again) keeps the
+  eMMC copy of the system current.
+- New kernels and initrds still go to partition 2 as before; the overlay
+  only covers the root file system.
+
 ## 7. Recovery and going back
 
 - **The eMMC system does not boot:** boot the rescue stick with USB Copy
   held (step 3) and repair the eMMC from there.
+- **The read-only root does not come up:** hold USB Copy at power-on
+  without a stick plugged in (or with the rescue stick: it boots its own
+  root). Stage 1 never uses the overlay on a recovery boot, so the eMMC
+  root starts writable, without the changes kept on the data volume. Fix
+  the problem there, or turn the overlay off for good with
+  `ts328-overlay disable --discard`; the changes stay in
+  `/srv/data/system/root-overlay/` (`enable` moves them aside later).
 - **The eMMC has failed completely:** U-Boot lives in the SPI flash, not on
   the eMMC, so the rescue stick still boots the whole system. Hold USB Copy
   at every power-on (after a power cut too). The stick holds its own basic

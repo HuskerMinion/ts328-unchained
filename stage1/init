@@ -15,7 +15,9 @@
 # mounted with "noload" while it is probed, so probing never writes to a
 # disk (no journal replay, no orphan cleanup), not even to RAID members.
 # Partitions with an md superblock (1.1 or 1.2, at the start) are skipped.
-# Only the partition that holds the root is made writable again.
+# Only the partition that holds the root is made writable again (not even
+# that one when the root is read-only: /etc/ts328-overlay.conf, see
+# platform/sbin/ts328-overlay).
 /bin/busybox --install -s /bin
 export PATH=/bin:/sbin
 mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
@@ -36,6 +38,13 @@ is_md() {
 	return 1
 }
 
+# UUID of an ext2/3/4 file system (from its superblock), empty if it is not one
+hexbytes() { dd if=$1 bs=1 skip=$2 count=$3 2>/dev/null | od -An -tx1 | tr -d ' \n'; }
+fsuuid() {
+	[ "$(hexbytes $1 1080 2)" = 53ef ] || return 0
+	hexbytes $1 1128 16 | sed 's/^\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)/\1-\2-\3-\4-/'
+}
+
 mkdir -p /newroot
 PROBED=""
 probe() {	# probe <partition> <kind>
@@ -45,6 +54,24 @@ probe() {	# probe <partition> <kind>
 	if mount -t ext4 -o ro,noload /dev/$1 /newroot 2>/dev/null; then
 		if [ "$(cat /newroot/etc/qnas-root 2>/dev/null)" = "QNAS-ROOT-v1" ] &&
 		   { [ -e /newroot/sbin/init ] || [ -L /newroot/sbin/init ]; }; then
+			# Read-only root requested (see ts328-overlay)? Only for the
+			# internal root on a normal boot, and only if the conf was
+			# written for this very file system (not copied with it).
+			if grep -qx 'OVERLAY=1' /newroot/etc/ts328-overlay.conf 2>/dev/null; then
+				r=$(fsuuid /dev/$1)
+				if [ "$1" != mmcblk0p7 ] || grep -qw factory_recovery /proc/cmdline; then
+					log "not the eMMC root, or a recovery boot: read-only root not used"
+				elif [ -z "$r" ] || ! grep -qx "DIR=.*/$r" /newroot/etc/ts328-overlay.conf; then
+					log "ts328-overlay.conf belongs to another root file system: not used"
+				else
+					cp /newroot/etc/ts328-overlay.conf /etc/ts328-overlay.conf
+					[ -f /newroot/etc/mdadm/mdadm.conf ] && cp /newroot/etc/mdadm/mdadm.conf /etc/mdadm.conf
+					umount /newroot
+					ROOTDEV=$1
+					log "root on /dev/$1 ($2), read-only with an overlay"
+					return 0
+				fi
+			fi
 			umount /newroot
 			blockdev --setrw /dev/$1
 			# Mounted read-write here: the root needs no /etc/fstab entry,
@@ -52,6 +79,7 @@ probe() {	# probe <partition> <kind>
 			# copies of the same image. commit=60: fewer small writes to
 			# flash (up to 60 s of changes can be lost on a power cut).
 			if mount -t ext4 -o rw,noatime,commit=60,errors=remount-ro /dev/$1 /newroot; then
+				rm -f /newroot/etc/ts328-overlay.state	# an old "failed" from an earlier boot
 				log "root on /dev/$1 ($2)"
 				return 0
 			fi
@@ -104,7 +132,134 @@ if [ -z "$found" ]; then
 		sleep 5
 	done
 fi
-# Give every other probed partition its normal writability back.
-for n in $PROBED; do [ -b /dev/$n ] && blockdev --setrw /dev/$n; done
+# Give every other probed partition its normal writability back (the
+# read-only root stays read-only at the block layer).
+for n in $PROBED; do [ -b /dev/$n ] && [ "$n" != "${ROOTDEV:-}" ] && blockdev --setrw /dev/$n; done
+
+# Read-only root: the eMMC root is the lower layer, changes go to a
+# directory on the data volume (assembled here), so the eMMC is not written.
+# If the data volume is not there, changes go to RAM for this boot only.
+conf() { sed -n "s|^$1=\($2\)$|\1|p" /etc/ts328-overlay.conf | head -1; }
+
+# The data volume: an md array when mdadm.conf lists one (never a member
+# disk), otherwise an internal SATA partition. Never USB or the eMMC, so a
+# stick with a copy of the file system cannot take the place of the volume.
+find_data() {
+	if grep -q '^ARRAY' /etc/mdadm.conf; then
+		set -- /dev/md[0-9]* /dev/md/*
+	else
+		set -- $(parts | grep '^sd' | sed 's|^|/dev/|')
+	fi
+	for d; do
+		[ -b $d ] || continue
+		n=$(basename $(readlink -f $d))
+		case $n in md*) ;; *) is_usb $n && continue; is_md $n && continue
+			[ -n "$(ls /sys/class/block/$n/holders 2>/dev/null)" ] && continue;; esac
+		[ "$(fsuuid $d)" = "$uuid" ] && { echo $d; return 0; }
+	done
+	return 1
+}
+
+# Every directory from the volume down to upper/ and work/ must be a real
+# directory owned by root and not writable by anyone else; otherwise a
+# share user could put files into the root.
+safe_dir() {
+	[ -d "$1" ] && [ ! -L "$1" ] || return 1
+	set -- $(stat -c '%u %a' "$1")
+	[ "$1" = 0 ] || return 1
+	case $2 in *[2367]? | *[2367]) return 1;; esac
+}
+safe_path() {
+	p=/data; safe_dir $p || return 1
+	for part in $(echo "$dir/$1" | tr / ' '); do p=$p/$part; safe_dir $p || return 1; done
+}
+
+overlay_root() {
+	uuid=$(conf DATA_UUID '[0-9A-Fa-f-]\{36\}' | tr A-F a-f)
+	dir=$(conf DIR '[A-Za-z0-9._/-]\{1,200\}')
+	mnt=$(conf DATA_MOUNT '/[A-Za-z0-9._/-]\{1,100\}')
+	case "/$dir/" in */../* | */./* | *//*) dir=;; esac
+	case "$mnt/" in */../* | */./* | *//*) mnt=;; /srv/?* | /mnt/?*) ;; *) mnt=;; esac
+	mkdir -p /ro /data /rw /run/mdadm /newroot
+	if ! mount -t ext4 -o ro,noatime /dev/$ROOTDEV /ro; then
+		# the journal needs a replay (after a power cut): allow that write once
+		blockdev --setrw /dev/$ROOTDEV
+		mount -t ext4 -o ro,noatime /dev/$ROOTDEV /ro || return 1
+		blockdev --setro /dev/$ROOTDEV
+		log "eMMC root journal replayed"
+	fi
+	mode=ram
+	if [ -n "$uuid" ] && [ -n "$dir" ] && [ -n "$mnt" ]; then
+		[ -f /etc/mdadm.conf ] || printf 'DEVICE partitions\nAUTO +all\n' > /etc/mdadm.conf
+		# Wait up to about 30 s for all disks of the array (they may still
+		# be spinning up); only the last tries start it degraded, so a slow
+		# disk is not dropped from the array.
+		dev=""
+		i=0
+		while [ $i -lt 30 ]; do
+			i=$((i + 1))
+			dev=$(find_data) && break
+			if [ $i -le 25 ]; then
+				mdadm --assemble --scan --no-degraded --config=/etc/mdadm.conf >/dev/null 2>&1
+			else
+				mdadm --assemble --scan --run --config=/etc/mdadm.conf >/dev/null 2>&1
+			fi
+			dev=$(find_data) && break
+			mdadm --stop --scan >/dev/null 2>&1	# not complete yet: let go of the disks
+			sleep 1
+		done
+		if [ -n "$dev" ] && mount -t ext4 -o rw,noatime $dev /data; then
+			u=/data/$dir
+			mkdir -p $u
+			if ! safe_path .; then
+				log "the overlay directory is not root-only on the data volume: changes go to RAM"
+				umount /data
+			else
+				if [ -e $u/reset ]; then
+					rm -rf $u/upper $u/work $u/reset
+					log "overlay reset: starting again from the eMMC root"
+				fi
+				mkdir -p $u/upper $u/work
+				if safe_path upper && safe_path work &&
+				   mount -t overlay overlay -o lowerdir=/ro,upperdir=$u/upper,workdir=$u/work /newroot; then
+					mode=data
+				else
+					log "overlay on the data volume failed: changes go to RAM"
+					umount /data
+				fi
+			fi
+		else
+			mdadm --stop --scan >/dev/null 2>&1
+			log "data volume $uuid not found: changes go to RAM for this boot"
+		fi
+	else
+		log "/etc/ts328-overlay.conf is incomplete: changes go to RAM for this boot"
+	fi
+	if [ $mode = ram ]; then
+		mount -t tmpfs -o mode=755,size=40% tmpfs /rw && mkdir -p /rw/upper /rw/work &&
+			mount -t overlay overlay -o lowerdir=/ro,upperdir=/rw/upper,workdir=/rw/work /newroot || return 1
+		mkdir -p /newroot/media/root-rw && mount -o move /rw /newroot/media/root-rw
+	fi
+	mkdir -p /newroot/media/root-ro && mount -o move /ro /newroot/media/root-ro
+	if [ $mode = data ]; then
+		mkdir -p /newroot$mnt && mount -o move /data /newroot$mnt
+	fi
+	echo $mode > /newroot/etc/ts328-overlay.state
+	if [ $mode = data ]; then log "read-only root: changes kept on the data volume"
+	else log "read-only root: changes kept in RAM for this boot"; fi
+	return 0
+}
+if [ -n "${ROOTDEV:-}" ] && ! overlay_root; then
+	# overlay impossible: fall back to the normal writable root
+	log "overlay failed: mounting the root read-write"
+	umount /newroot 2>/dev/null; umount /ro 2>/dev/null
+	blockdev --setrw /dev/$ROOTDEV
+	if mount -t ext4 -o rw,noatime,commit=60,errors=remount-ro /dev/$ROOTDEV /newroot; then
+		echo failed > /newroot/etc/ts328-overlay.state
+	else
+		log "cannot mount the root: rebooting in 10 s"
+		sleep 10; reboot -f
+	fi
+fi
 umount /sys; umount /proc; umount /dev 2>/dev/null
 exec switch_root /newroot /sbin/init
