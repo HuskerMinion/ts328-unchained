@@ -66,7 +66,7 @@ this boot clones the whole stick onto the eMMC.)
 | `kernel/build.sh` | clone, patch, configure, build and package |
 | `stage1/` | stage-1 initrd (busybox, plus mdadm for the optional read-only root) and its build script |
 | `debian/` | rootless Debian 12 root filesystem build (mmdebstrap) |
-| `platform/` | front panel, fan, RAID event and voice-prompt tools and systemd units |
+| `platform/` | front panel, fan, RAID event, voice-prompt, eMMC-write, read-only-root and rescue-stick tools and systemd units |
 | `tools/` | `mkboot.sh` (boot set packaging); `emmc-boot1-test.c` (development test that writes the eMMC boot1 area; not needed for installation) |
 | `docs/` | installation and hardware notes |
 

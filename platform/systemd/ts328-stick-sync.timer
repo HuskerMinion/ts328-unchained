@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Keep the rescue stick's boot files current (15 min after boot, then daily)
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1d
+
+[Install]
+WantedBy=timers.target

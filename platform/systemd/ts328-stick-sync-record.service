@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Note the boot files this system booted from (for ts328-stick-sync)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ts328-stick-sync --record
+TimeoutStartSec=2min
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Keep the rescue stick's boot files current
+After=ts328-stick-sync-record.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ts328-stick-sync
+TimeoutStartSec=10min

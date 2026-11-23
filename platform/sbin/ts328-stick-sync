@@ -1,0 +1,118 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Keep a rescue stick left in a USB port current: copy the boot files
+# (Image, realtek.dtb, initrd.boot, bluecore.audio and their .cksum files)
+# from eMMC partition 2 to the stick's boot partition (ext2, label TS328BOOT,
+# as made in INSTALL.md step 3). The files they replace are kept on the stick
+# as <file>.prev.
+#
+# Only a boot set that has proven itself is copied: at boot,
+# "ts328-stick-sync --record" (ts328-stick-sync-record.service) notes the
+# checksums of the set on partition 2 that the system booted from; the sync
+# (ts328-stick-sync.timer, daily) copies only that set, unchanged, after a
+# day of uptime, and never on a recovery boot. The stick's root file system
+# is not touched.
+#
+# Usage: ts328-stick-sync [--record]
+set -eu
+RECORD=/run/ts328-booted-set
+FILES="Image realtek.dtb initrd.boot bluecore.audio"
+MIN_UPTIME=${MIN_UPTIME:-86000}
+say() { echo "$*"; }	# stdout goes to the journal (journalctl -u ts328-stick-sync)
+
+# the checksum lines of the set on partition 2, in a fixed order
+p2_set() {
+	for f in $FILES; do [ -f "$1/$f.cksum" ] && echo "$f $(cut -d' ' -f1,2 "$1/$f.cksum")"; done; :
+}
+booted_size() { sed -n 's/.*initrd=0x[0-9a-fA-F]*,\([0-9]*\).*/\1/p' /proc/cmdline; }
+
+if [ "${1:-}" = --record ]; then
+	rm -f $RECORD
+	grep -qw factory_recovery /proc/cmdline && exit 0
+	# only at boot: later, partition 2 may already hold files not yet booted
+	[ "$(cut -d. -f1 /proc/uptime)" -lt 600 ] || { say "--record only works at boot"; exit 0; }
+	W=$(mktemp -d); trap 'set +e; umount "$W" 2>/dev/null; rmdir "$W" 2>/dev/null; :' EXIT
+	mount -o ro /dev/mmcblk0p2 "$W"
+	size=$(booted_size)
+	# the initrd (by size) and the kernel (its version banner) must be the running ones
+	if [ -n "$size" ] && [ "$size" = "$(stat -c %s "$W/boot/initrd.boot" 2>/dev/null)" ] &&
+	   gzip -dc "$W/boot/Image" 2>/dev/null | grep -qF "$(cat /proc/version)"; then
+		p2_set "$W/boot" > $RECORD
+	else
+		say "partition 2 is not the boot set this system booted from: nothing recorded"
+	fi
+	exit 0
+fi
+grep -qw factory_recovery /proc/cmdline && { echo "recovery boot: stick not updated"; exit 0; }
+[ -s $RECORD ] || { say "no record of the boot set this system booted from: stick not updated"; exit 0; }
+
+stick=""
+for n in $(lsblk -nro NAME,LABEL 2>/dev/null | awk '$2 == "TS328BOOT" {print $1}'); do
+	case $(readlink -f /sys/class/block/$n) in */usb*) ;; *) continue;; esac
+	[ "$(blkid -o value -s TYPE /dev/$n 2>/dev/null)" = ext2 ] || { say "/dev/$n is labeled TS328BOOT but is not ext2: ignored"; continue; }
+	stick=/dev/$n; break
+done
+[ -n "$stick" ] || { echo "no rescue stick (ext2, TS328BOOT, on USB) plugged in"; exit 0; }
+! findmnt -n "$stick" >/dev/null || { say "$stick is mounted elsewhere: not updated"; exit 0; }
+
+W=$(mktemp -d)
+trap 'set +e; umount "$W/stick" 2>/dev/null; umount "$W/p2" 2>/dev/null; rmdir "$W/stick" "$W/p2" "$W" 2>/dev/null; :' EXIT
+trap 'exit 1' HUP INT TERM
+mkdir "$W/p2" "$W/stick"
+mount -o ro /dev/mmcblk0p2 "$W/p2"
+src=$W/p2/boot
+
+# partition 2 must still hold exactly the set this system booted from
+[ "$(p2_set "$src")" = "$(cat $RECORD)" ] ||
+	{ say "partition 2 holds boot files this system has not booted from: stick not updated"; exit 0; }
+for f in $FILES; do
+	[ -f "$src/$f" ] || continue
+	[ -f "$src/$f.cksum" ] || { say "$f.cksum is missing on partition 2: stick not updated"; exit 1; }
+	set -- $(cksum < "$src/$f")
+	[ "$1 $2" = "$(cut -d' ' -f1,2 "$src/$f.cksum")" ] || { say "$f on partition 2 fails its checksum: stick not updated"; exit 1; }
+done
+
+# The stick is untrusted media: no device files, no set-uid, no symlinks
+# followed; only regular files are read or replaced (never written through).
+opts=nosuid,nodev,noexec,nosymfollow
+mount -t ext2 -o "$opts" "$stick" "$W/stick"
+dst=$W/stick/boot
+[ -d "$dst" ] && [ ! -L "$dst" ] || { say "$stick has no boot/ folder: not updated"; exit 1; }
+same() { [ -f "$2" ] && [ ! -L "$2" ] && cmp -s "$1" "$2"; }
+changed=""
+for f in $FILES; do
+	[ -f "$src/$f" ] || continue
+	same "$src/$f" "$dst/$f" && same "$src/$f.cksum" "$dst/$f.cksum" && continue
+	changed="$changed $f"
+done
+[ -n "$changed" ] || { echo "rescue stick $stick is current"; exit 0; }
+up=$(cut -d. -f1 /proc/uptime)
+[ "$up" -ge "$MIN_UPTIME" ] ||
+	{ say "the stick differs from partition 2: it is updated once this boot set has run for a day"; exit 0; }
+
+cleanup='set +e; umount "$W/stick" 2>/dev/null; umount "$W/p2" 2>/dev/null; rmdir "$W/stick" "$W/p2" "$W" 2>/dev/null; :'
+trap "set +e; rm -f \"\$dst\"/*.new; $cleanup" EXIT	# a failed copy leaves no partial files
+for f in $changed; do
+	for x in "$f" "$f.cksum"; do
+		rm -f "$dst/$x.new"
+		cp "$src/$x" "$dst/$x.new"
+	done
+done
+sync
+# From here every file name stays present: the old file is kept as .prev by
+# a hard link, and the rename replaces the name in one step.
+trap "$cleanup" EXIT
+for f in $changed; do
+	for x in "$f" "$f.cksum"; do
+		if [ -f "$dst/$x" ] && [ ! -L "$dst/$x" ]; then ln -f "$dst/$x" "$dst/$x.prev"; fi
+		mv "$dst/$x.new" "$dst/$x"
+	done
+done
+sync; umount "$W/stick"
+mount -t ext2 -o "ro,$opts" "$stick" "$W/stick"	# fresh mount: read back from the stick
+for f in $changed; do
+	set -- $(cksum < "$dst/$f")
+	[ "$1 $2" = "$(cut -d' ' -f1,2 "$dst/$f.cksum")" ] || { say "$f is damaged on the stick ($stick): check it"; exit 1; }
+done
+say "rescue stick $stick updated:$changed (the old files are kept as .prev)"

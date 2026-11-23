@@ -108,7 +108,8 @@ Boot it:
    password; only your key works.
 
 Check that everything works: `lsblk`, `ip addr`, `dmesg`. This stick is
-also your **rescue stick**: keep it.
+also your **rescue stick**: keep it (left plugged in, step 5 can keep its
+boot files current).
 
 ## 4. Install to the eMMC (from the system running on the stick)
 
@@ -191,10 +192,21 @@ install -m 755 /root/platform/sbin/* /usr/local/sbin/
 install -m 644 /root/platform/systemd/*.service /root/platform/systemd/*.timer /etc/systemd/system/
 install -D -m 755 /root/platform/system-shutdown/qnap-mcu-poweroff /usr/lib/systemd/system-shutdown/qnap-mcu-poweroff
 systemctl daemon-reload && systemctl enable --now qnap-fan.service qnap-panel.service
+systemctl enable ts328-stick-sync-record.service && systemctl enable --now ts328-stick-sync.timer
 sh /root/platform/voice/install.sh
 ```
 
 The logind settings for the power button are already in the image.
+
+`ts328-stick-sync` keeps a rescue stick left in a USB port current. At boot
+it notes the checksums of the boot files on partition 2 that the system
+booted from; once a day it copies that same set to the stick's boot
+partition (ext2, label `TS328BOOT`, from step 3), but only after the set has
+run for a day, never on a recovery boot, and never a set that has not been
+booted. The files it replaces stay on the stick as `*.prev`, and the stick's
+root file system is not touched. To keep an older boot set on the stick
+anyway, unplug it before installing a new kernel. It starts working after
+the next boot. Results: `journalctl -u ts328-stick-sync`.
 
 For the RAID voice prompts, add `PROGRAM /usr/local/sbin/md-event` to
 `/etc/mdadm/mdadm.conf` and run `systemctl restart mdmonitor`.
@@ -308,7 +320,10 @@ ts328-overlay status
 - **The eMMC has failed completely:** U-Boot lives in the SPI flash, not on
   the eMMC, so the rescue stick still boots the whole system. Hold USB Copy
   at every power-on (after a power cut too). The stick holds its own basic
-  copy of Debian; the data volume is not touched.
+  copy of Debian; the data volume is not touched. If the stick was left
+  plugged in with `ts328-stick-sync` enabled (step 5), its boot files match
+  the last eMMC boot set that ran for a day; its root file system is still
+  the one from step 3.
 - **Back to the QTS kernel:** from the rescue stick system, lift
   `write_min_lba` (`echo 0 > ...`), mount partition 2, and rename the
   `*.qts` files back over `Image`, `realtek.dtb`, `initrd.boot` and their
